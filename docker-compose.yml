@@ -1,0 +1,35 @@
+version: "3.9"
+
+# Local development with PostgreSQL (optional — auth-service uses SQLite by default).
+# Use this when you want to test against a real PostgreSQL instance.
+#
+# Usage:
+#   docker compose up -d          # start postgres
+#   JWT_SECRET=... AUTH_ADMIN_KEY=... \
+#   QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://localhost:5432/authservice \
+#   QUARKUS_DATASOURCE_USERNAME=authservice \
+#   QUARKUS_DATASOURCE_PASSWORD=authservice \
+#   cd auth-service && ./mvnw quarkus:dev
+#
+#   docker compose down           # stop and remove containers
+#   docker compose down -v        # also remove the data volume
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: authservice
+      POSTGRES_USER: authservice
+      POSTGRES_PASSWORD: authservice
+    ports:
+      - "5435:5432"   # 5435 to avoid conflicts with other local postgres instances
+    volumes:
+      - auth_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authservice"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  auth_pg_data:

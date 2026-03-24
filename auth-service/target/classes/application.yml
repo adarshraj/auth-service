@@ -1,0 +1,79 @@
+quarkus:
+  application:
+    name: auth-service
+  datasource:
+    # Default: SQLite (zero operational overhead, no separate process). Works in production too.
+    # To use PostgreSQL instead: set QUARKUS_DATASOURCE_DB_KIND=postgresql,
+    # QUARKUS_DATASOURCE_JDBC_URL, QUARKUS_DATASOURCE_USERNAME, QUARKUS_DATASOURCE_PASSWORD.
+    # No rebuild required — both drivers are already on the classpath.
+    db-kind: other
+    jdbc:
+      driver: org.sqlite.JDBC
+      url: ${QUARKUS_DATASOURCE_JDBC_URL:jdbc:sqlite:${AUTH_DB_FILE:./authservice.db}}
+  hibernate-orm:
+    dialect: org.hibernate.community.dialect.SQLiteDialect
+  flyway:
+    migrate-at-start: true
+  http:
+    port: 8703
+    cors:
+      enabled: true
+      origins: "${AUTH_CORS_ORIGINS:*}"
+      methods: GET,POST,DELETE,OPTIONS,HEAD,PUT,PATCH
+      headers: accept,authorization,content-type,x-app-id,x-admin-key
+      access-control-max-age: 24H
+  otel:
+    enabled: true
+
+auth:
+  jwt:
+    # Shared HS256 secret — must match JWT_SECRET in all services that verify tokens (ai-wrap, etc.)
+    secret: ${JWT_SECRET:}
+    # Token expiry in seconds. Default 7 days.
+    expiry-seconds: ${AUTH_JWT_EXPIRY_SECONDS:604800}
+  admin-key: ${AUTH_ADMIN_KEY:}
+  # HMAC-SHA256 server secret for hashing the admin key before comparison.
+  key-hmac-secret: ${AUTH_KEY_HMAC_SECRET:dev-only-insecure-hmac-secret-change-in-prod}
+  rate-limit:
+    enabled: ${AUTH_RATE_LIMIT_ENABLED:true}
+    requests-per-minute: ${AUTH_RATE_LIMIT_RPM:60}
+  oauth:
+    google:
+      client-id: ${GOOGLE_CLIENT_ID:}
+      client-secret: ${GOOGLE_CLIENT_SECRET:}
+    github:
+      client-id: ${GITHUB_CLIENT_ID:}
+      client-secret: ${GITHUB_CLIENT_SECRET:}
+  # Base URL used to build OAuth callback URLs and token links.
+  base-url: ${AUTH_BASE_URL:http://localhost:8703}
+
+"%dev":
+  quarkus:
+    datasource:
+      jdbc:
+        url: ${QUARKUS_DATASOURCE_JDBC_URL:jdbc:sqlite:${AUTH_DB_FILE:./authservice-dev.db}}
+
+"%test":
+  quarkus:
+    datasource:
+      jdbc:
+        url: jdbc:sqlite:file:authservice-test?mode=memory&cache=shared
+    log:
+      level: INFO
+    otel:
+      enabled: false
+  auth:
+    jwt:
+      secret: "test-jwt-secret-at-least-32-chars!!"
+    admin-key: test-admin-key
+    key-hmac-secret: "test-hmac-secret-exactly-32-chars!!"
+    rate-limit:
+      enabled: false
+
+# No %prod datasource override — SQLite works fine for personal use in production.
+# To use PostgreSQL in prod, set these env vars at runtime (no rebuild needed):
+#   QUARKUS_DATASOURCE_DB_KIND=postgresql
+#   QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://host:5432/authservice
+#   QUARKUS_DATASOURCE_USERNAME=authservice
+#   QUARKUS_DATASOURCE_PASSWORD=...
+#   QUARKUS_HIBERNATE_ORM_DIALECT=org.hibernate.dialect.PostgreSQLDialect

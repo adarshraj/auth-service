@@ -1,0 +1,33 @@
+package com.authservice.api.dto
+
+import jakarta.validation.constraints.Email
+import jakarta.validation.constraints.NotBlank
+import jakarta.validation.constraints.Size
+
+// ── Requests ──────────────────────────────────────────────────────────────────
+
+data class RegisterRequest(
+    @field:NotBlank @field:Email val email: String = "",
+    @field:Size(min = 8, message = "Password must be at least 8 characters") val password: String? = null,
+    val name: String? = null,
+)
+
+data class LoginRequest(
+    @field:NotBlank @field:Email val email: String = "",
+    @field:NotBlank val password: String = "",
+)
+
+// ── Responses ────────────────────────────────────────────────────────────────
+
+data class UserResponse(
+    val id: String,
+    val email: String,
+    val name: String?,
+    val emailVerified: Boolean,
+    val avatarUrl: String?,
+)
+
+data class AuthResponse(
+    val token: String,
+    val user: UserResponse,
+)
