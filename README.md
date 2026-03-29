@@ -47,6 +47,49 @@ export AUTH_ADMIN_KEY="your-admin-key"
 
 SQLite is used by default — no database setup needed.
 
+## Production
+
+All commands below run from the `auth-service/` directory (where `pom.xml` lives).
+
+**Profile:** A packaged run uses Quarkus’s **`prod`** profile (not `quarkus:dev`). On startup, the service refuses to boot in prod unless `JWT_SECRET` is set and at least 32 characters, and unless `AUTH_KEY_HMAC_SECRET` is set to something other than the default dev value. Set `AUTH_ADMIN_KEY` if you need the `/auth/apps` admin API.
+
+**Database:** SQLite is fine for small deployments — persist the file (for example set `AUTH_DB_FILE` to a path on a mounted volume). For PostgreSQL, set `QUARKUS_DATASOURCE_DB_KIND=postgresql`, the JDBC URL, username, password, and `QUARKUS_HIBERNATE_ORM_DIALECT=org.hibernate.dialect.PostgreSQLDialect` (see comments in `src/main/resources/application.yml`).
+
+**OAuth:** Set `AUTH_BASE_URL` to your public origin (for example `https://auth.example.com`) and configure the Google/GitHub client env vars so callback URLs match your deployment.
+
+### Run the JVM package (bare metal or VM)
+
+```bash
+cd auth-service
+./mvnw package -DskipTests
+export JWT_SECRET="your-shared-secret-at-least-32-chars"
+export AUTH_KEY_HMAC_SECRET="your-hmac-secret-at-least-32-chars"
+export AUTH_ADMIN_KEY="your-admin-key"   # optional; omit to disable app management API
+# Optional: listen on all interfaces (Dockerfile JVM image sets this for containers)
+# export QUARKUS_HTTP_HOST=0.0.0.0
+java -jar target/quarkus-app/quarkus-run.jar
+```
+
+The HTTP server listens on port **8703** (see `application.yml`). Terminate TLS at a reverse proxy or load balancer in front of the app.
+
+### Docker (JVM image)
+
+Build the runnable layout, then build and run the stock Quarkus JVM image:
+
+```bash
+cd auth-service
+./mvnw package -DskipTests
+docker build -f src/main/docker/Dockerfile.jvm -t auth-service:latest .
+docker run --rm -p 8703:8703 \
+  -e JWT_SECRET="your-shared-secret-at-least-32-chars" \
+  -e AUTH_KEY_HMAC_SECRET="your-hmac-secret-at-least-32-chars" \
+  -e AUTH_ADMIN_KEY="your-admin-key" \
+  -e AUTH_BASE_URL="https://auth.example.com" \
+  auth-service:latest
+```
+
+The generated `Dockerfile.jvm` comments still refer to port 8080 from the Quarkus template; **this service uses 8703**, so map `8703:8703`. For a persistent SQLite file inside the container, mount a volume and set `AUTH_DB_FILE` (or point `QUARKUS_DATASOURCE_JDBC_URL` at your SQLite path).
+
 ## Per-app access control
 
 Apps registered with `requiresExplicitAccess: false` (default) let any registered user log in.

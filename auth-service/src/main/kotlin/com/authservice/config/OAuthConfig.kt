@@ -1,8 +1,8 @@
 package com.authservice.config
 
 import io.smallrye.config.ConfigMapping
-import io.smallrye.config.WithDefault
 import io.smallrye.config.WithName
+import java.util.Optional
 
 @ConfigMapping(prefix = "auth.oauth")
 interface OAuthConfig {
@@ -12,11 +12,9 @@ interface OAuthConfig {
 
     interface Provider {
         @WithName("client-id")
-        @WithDefault("")
-        fun clientId(): String
+        fun clientId(): Optional<String>
 
         @WithName("client-secret")
-        @WithDefault("")
-        fun clientSecret(): String
+        fun clientSecret(): Optional<String>
     }
 }

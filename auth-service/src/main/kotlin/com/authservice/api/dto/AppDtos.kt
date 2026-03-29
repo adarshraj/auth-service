@@ -11,6 +11,7 @@ data class CreateAppRequest(
     val id: String = "",
     @field:NotBlank val name: String = "",
     val requiresExplicitAccess: Boolean = false,
+    val redirectUris: List<String> = emptyList(),
 )
 
 data class GrantAccessRequest(
@@ -23,6 +24,7 @@ data class AppResponse(
     val id: String,
     val name: String,
     val requiresExplicitAccess: Boolean,
+    val redirectUris: List<String>,
     val createdAt: String,
 )
 

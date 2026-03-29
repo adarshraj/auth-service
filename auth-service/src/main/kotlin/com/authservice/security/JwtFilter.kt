@@ -16,7 +16,7 @@ import org.jboss.logging.Logger
  *   GET  /auth/me
  *   DELETE /auth/account
  *
- * All other /auth/* endpoints are public (login, register, oauth, etc.).
+ * All other /auth/ * endpoints are public (login, register, oauth, etc.).
  */
 @Provider
 @Priority(Priorities.AUTHENTICATION)

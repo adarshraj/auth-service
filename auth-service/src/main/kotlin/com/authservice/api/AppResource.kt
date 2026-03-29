@@ -62,6 +62,7 @@ class AppResource @Inject constructor(
             id = body.id
             name = body.name
             requiresExplicitAccess = body.requiresExplicitAccess
+            redirectUris = body.redirectUris.takeIf { it.isNotEmpty() }?.joinToString("\n")
             createdAt = Instant.now()
         }
         appRepository.persist(app)
@@ -151,6 +152,7 @@ class AppResource @Inject constructor(
         id = id,
         name = name,
         requiresExplicitAccess = requiresExplicitAccess,
+        redirectUris = allowedRedirectUris(),
         createdAt = createdAt.toString(),
     )
 

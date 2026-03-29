@@ -21,8 +21,15 @@ class AppEntity {
     @Column(name = "requires_explicit_access", nullable = false)
     var requiresExplicitAccess: Boolean = false
 
+    /** Newline-separated list of allowed redirect URIs for OAuth browser flows. Null = none registered. */
+    @Column(name = "redirect_uris")
+    var redirectUris: String? = null
+
     @Column(name = "created_at", nullable = false)
     lateinit var createdAt: Instant
+
+    fun allowedRedirectUris(): List<String> =
+        redirectUris?.lines()?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
 }
 
 @ApplicationScoped

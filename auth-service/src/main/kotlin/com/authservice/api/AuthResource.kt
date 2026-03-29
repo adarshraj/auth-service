@@ -4,6 +4,7 @@ import com.authservice.api.dto.AuthResponse
 import com.authservice.api.dto.LoginRequest
 import com.authservice.api.dto.RegisterRequest
 import com.authservice.api.dto.UserResponse
+import com.authservice.domain.AppRepository
 import com.authservice.security.CallerContext
 import com.authservice.security.JwtFilter
 import com.authservice.security.RateLimiter
@@ -43,6 +44,7 @@ class AuthResource @Inject constructor(
     private val jwtService: JwtService,
     private val oauthService: OAuthService,
     private val rateLimiter: RateLimiter,
+    private val appRepository: AppRepository,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(AuthResource::class.java)
@@ -125,8 +127,12 @@ class AuthResource @Inject constructor(
     fun oauthRedirect(
         @PathParam("provider") provider: String,
         @HeaderParam("X-App-Id") appId: String?,
+        @QueryParam("redirect_uri") redirectUri: String?,
     ): Response {
-        val state = buildOAuthState(provider, appId)
+        if (redirectUri != null) {
+            validateRedirectUri(redirectUri, appId)
+        }
+        val state = buildOAuthState(provider, appId, redirectUri)
         val url = when (provider) {
             "google" -> oauthService.googleAuthUrl(state)
             "github" -> oauthService.githubAuthUrl(state)
@@ -139,18 +145,17 @@ class AuthResource @Inject constructor(
 
     @GET
     @Path("/oauth/callback")
-    @Produces(MediaType.APPLICATION_JSON)
-    @Operation(summary = "OAuth callback — exchange code for JWT")
+    @Operation(summary = "OAuth callback — exchange code for JWT; redirects to redirect_uri if present in state")
     fun oauthCallback(
         @QueryParam("provider") provider: String?,
         @QueryParam("code") code: String?,
         @QueryParam("state") state: String?,
         @QueryParam("error") error: String?,
-    ): AuthResponse {
+    ): Response {
         if (error != null) throw BadRequestException("OAuth error: $error")
         if (code.isNullOrBlank()) throw BadRequestException("Missing OAuth code")
 
-        val (resolvedProvider, appId) = parseOAuthState(state, provider)
+        val (resolvedProvider, appId, redirectUri) = parseOAuthState(state, provider)
 
         val oauthUser = when (resolvedProvider) {
             "google" -> oauthService.exchangeGoogleCode(code)
@@ -167,7 +172,13 @@ class AuthResource @Inject constructor(
             appId = appId,
         )
         val token = jwtService.sign(user.id, user.email, appId)
-        return AuthResponse(token, user.toResponse())
+
+        return if (redirectUri != null) {
+            val location = URI.create("$redirectUri#token=$token")
+            Response.temporaryRedirect(location).build()
+        } else {
+            Response.ok(AuthResponse(token, user.toResponse())).build()
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -187,24 +198,51 @@ class AuthResource @Inject constructor(
         }
     }
 
-    /** Encode provider + appId into the OAuth state param. */
-    private fun buildOAuthState(provider: String, appId: String?): String {
+    /** Encode provider + appId + redirectUri into the OAuth state param.
+     *  Format: base64(provider\nappId\nnonce[\nredirectUri])
+     *  Using newline as delimiter inside base64 avoids collision with URL-special chars in redirectUri. */
+    private fun buildOAuthState(provider: String, appId: String?, redirectUri: String?): String {
         val nonce = ByteArray(16).also { secureRandom.nextBytes(it) }
             .joinToString("") { "%02x".format(it) }
-        return if (appId != null) "$provider:$appId:$nonce" else "$provider::$nonce"
+        val parts = listOfNotNull(provider, appId ?: "", nonce, redirectUri)
+        return java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(parts.joinToString("\n").toByteArray())
     }
 
-    /** Decode provider + appId from state; fall back to query param for provider. */
-    private fun parseOAuthState(state: String?, fallbackProvider: String?): Pair<String, String?> {
+    /** Decode provider + appId + redirectUri from state; fall back to query param for provider. */
+    private fun parseOAuthState(state: String?, fallbackProvider: String?): Triple<String, String?, String?> {
         if (!state.isNullOrBlank()) {
+            try {
+                val decoded = String(java.util.Base64.getUrlDecoder().decode(state))
+                val parts = decoded.split("\n")
+                if (parts.size >= 3) {
+                    val p = parts[0].takeIf { it.isNotBlank() } ?: fallbackProvider ?: "google"
+                    val a = parts[1].takeIf { it.isNotBlank() }
+                    val r = parts.getOrNull(3)?.takeIf { it.isNotBlank() }
+                    return Triple(p, a, r)
+                }
+            } catch (_: Exception) {
+                // fall through to legacy format
+            }
+            // legacy plain-text state: "provider:appId:nonce"
             val parts = state.split(":")
             if (parts.size >= 2) {
                 val p = parts[0].takeIf { it.isNotBlank() } ?: fallbackProvider ?: "google"
                 val a = parts[1].takeIf { it.isNotBlank() }
-                return p to a
+                return Triple(p, a, null)
             }
         }
-        return (fallbackProvider ?: "google") to null
+        return Triple(fallbackProvider ?: "google", null, null)
+    }
+
+    /** Validate that the given redirect URI is registered for the app. */
+    private fun validateRedirectUri(redirectUri: String, appId: String?) {
+        if (appId == null) throw BadRequestException("redirect_uri requires X-App-Id")
+        val app = appRepository.findById(appId)
+            ?: throw BadRequestException("Unknown app: $appId")
+        val allowed = app.allowedRedirectUris()
+        if (allowed.isEmpty()) throw BadRequestException("App '$appId' has no redirect URIs registered")
+        if (redirectUri !in allowed) throw BadRequestException("redirect_uri is not registered for app '$appId'")
     }
 
     private fun UserService.UserView.toResponse() = UserResponse(

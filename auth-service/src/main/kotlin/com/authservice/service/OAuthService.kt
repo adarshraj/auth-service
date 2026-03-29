@@ -37,9 +37,10 @@ class OAuthService @Inject constructor(
 
     fun googleAuthUrl(state: String): String {
         val cfg = oauthConfig.google()
-        if (cfg.clientId().isBlank()) throw BadRequestException("Google OAuth is not configured")
+        val clientId = cfg.clientId().orElse("").takeIf { it.isNotBlank() }
+            ?: throw BadRequestException("Google OAuth is not configured")
         val params = mapOf(
-            "client_id" to cfg.clientId(),
+            "client_id" to clientId,
             "redirect_uri" to "$baseUrl/auth/oauth/callback?provider=google",
             "response_type" to "code",
             "scope" to "openid email profile",
@@ -54,8 +55,8 @@ class OAuthService @Inject constructor(
         val cfg = oauthConfig.google()
         val tokenBody = mapOf(
             "code" to code,
-            "client_id" to cfg.clientId(),
-            "client_secret" to cfg.clientSecret(),
+            "client_id" to cfg.clientId().orElse(""),
+            "client_secret" to cfg.clientSecret().orElse(""),
             "redirect_uri" to "$baseUrl/auth/oauth/callback?provider=google",
             "grant_type" to "authorization_code",
         ).toFormEncoded()
@@ -76,9 +77,10 @@ class OAuthService @Inject constructor(
 
     fun githubAuthUrl(state: String): String {
         val cfg = oauthConfig.github()
-        if (cfg.clientId().isBlank()) throw BadRequestException("GitHub OAuth is not configured")
+        val clientId = cfg.clientId().orElse("").takeIf { it.isNotBlank() }
+            ?: throw BadRequestException("GitHub OAuth is not configured")
         val params = mapOf(
-            "client_id" to cfg.clientId(),
+            "client_id" to clientId,
             "redirect_uri" to "$baseUrl/auth/oauth/callback?provider=github",
             "scope" to "user:email",
             "state" to state,
@@ -89,8 +91,8 @@ class OAuthService @Inject constructor(
     fun exchangeGithubCode(code: String): OAuthUser {
         val cfg = oauthConfig.github()
         val tokenBody = mapper.writeValueAsString(mapOf(
-            "client_id" to cfg.clientId(),
-            "client_secret" to cfg.clientSecret(),
+            "client_id" to cfg.clientId().orElse(""),
+            "client_secret" to cfg.clientSecret().orElse(""),
             "code" to code,
         ))
 
