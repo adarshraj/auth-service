@@ -135,3 +135,30 @@ The `X-Admin-Key` header value is never stored raw. Comparison works by hashing 
 - `kid` — key ID in the header; matches the `kid` in the JWKS response.
 
 Tokens are signed with ES256 (ECDSA P-256). Verify using the public key from `GET /.well-known/jwks.json`.
+
+## Why ES256 and not RS256
+
+RS256 (RSA + SHA-256) was considered but not implemented due to **performance concerns on a personal/low-resource server**:
+
+| | ES256 (current) | RS256 (alternative) |
+|---|---|---|
+| Algorithm | ECDSA P-256 | RSA 2048-bit |
+| Key generation | Fast | Slow (~100ms+ on low-end hardware) |
+| Signing | Fast | Slow (modular exponentiation) |
+| Verification | Moderate | Fast (public exponent is small) |
+| Key size on disk | ~200 bytes | ~1700 bytes |
+| Security level | 128-bit | 112-bit (2048-bit RSA) |
+
+ES256 provides **stronger security with significantly less CPU cost** at signing time, which matters on a personal server handling every login.
+
+### What would need to change to switch to RS256
+
+The change is isolated to `EcKeyService` and `JwtService` — no DB schema changes, no API changes.
+
+1. **`EcKeyService`** — replace `KeyPairGenerator` algorithm from `"EC"` / `ECGenParameterSpec("secp256r1")` to `"RSA"` / `RSAKeyGenParameterSpec(2048, ...)`. Change `ECPrivateKey`/`ECPublicKey` types to `RSAPrivateKey`/`RSAPublicKey`. Update `publicKeyAsJwk()` to emit `"kty": "RSA"` with `n` (modulus) and `e` (exponent) instead of `x`/`y`/`crv`.
+
+2. **`JwtService`** — no code change needed; `builder.signWith(ecKeyService.privateKey)` auto-detects the algorithm from the key type. jjwt will switch to RS256 automatically when given an `RSAPrivateKey`.
+
+3. **`EcKeyEntity`** / **DB** — column names (`private_key_pkcs8`, `public_key_x509`) stay the same; only the stored bytes change. A DB wipe or migration to clear the old EC key row is needed so the new RSA key pair is generated on next boot.
+
+That is the full scope — roughly 20 lines changed in `EcKeyService`.
