@@ -152,6 +152,20 @@ On first register/OAuth-login into a `requiresExplicitAccess: true` app, access 
 
 finance-tracker uses bcrypt with cost factor 10 — same as this service. Export the `users` table and import directly; no re-hashing needed.
 
+## Why ES256 and not RS256
+
+RS256 (RSA + SHA-256) was considered but not implemented due to **performance concerns on a personal/low-resource server**:
+
+| | ES256 (current) | RS256 |
+|---|---|---|
+| Algorithm | ECDSA P-256 | RSA 2048-bit |
+| Signing speed | Fast | Slow (modular exponentiation) |
+| Key generation | Fast | Slow (~100ms+ on low-end hardware) |
+| Security level | 128-bit | 112-bit (2048-bit RSA) |
+| Key size | ~200 bytes | ~1700 bytes |
+
+ES256 provides stronger security with significantly less CPU cost at signing time. If requirements change, the switch is isolated to ~20 lines in `EcKeyService` — no API, DB schema, or consumer-side changes needed beyond updating the JWK type.
+
 ## Migrating consuming services from HS256
 
 Services that previously verified JWTs using `JWT_SECRET` need to be updated:
