@@ -15,6 +15,8 @@ import jakarta.ws.rs.BadRequestException
 import jakarta.ws.rs.ForbiddenException
 import jakarta.ws.rs.NotFoundException
 import jakarta.ws.rs.NotAuthorizedException
+import jakarta.ws.rs.WebApplicationException
+import jakarta.ws.rs.core.Response
 import org.jboss.logging.Logger
 import java.security.SecureRandom
 import java.time.Instant
@@ -47,7 +49,8 @@ class UserService @Inject constructor(
     fun register(email: String, password: String?, name: String?, appId: String?): UserView {
         val normalizedEmail = email.lowercase().trim()
         if (userRepository.findByEmail(normalizedEmail) != null) {
-            throw BadRequestException("An account with this email already exists")
+            // Generic message — do not reveal whether the email is registered (prevents enumeration)
+            throw BadRequestException("Registration failed — check your details and try again")
         }
         val user = UserEntity().apply {
             id = generateId()
@@ -61,7 +64,6 @@ class UserService @Inject constructor(
         userRepository.persist(user)
         log.infof("Registered user id=%s email=%s", user.id, user.email)
 
-        // If registering into a specific app that requires explicit access, auto-grant on first register
         if (appId != null) {
             val app = appRepository.findById(appId)
             if (app != null && app.requiresExplicitAccess) {
@@ -103,23 +105,27 @@ class UserService @Inject constructor(
         avatarUrl: String?,
         appId: String?,
     ): UserView {
-        // Try find by OAuth identity first
+        // Match by OAuth identity first
         var user = userRepository.findByOAuth(provider, oauthId)
 
         if (user == null) {
-            // Try by email — link OAuth to existing password account
-            user = userRepository.findByEmail(email.lowercase().trim())
-            if (user != null) {
-                // Link OAuth to the existing account
-                user.oauthProvider = provider
-                user.oauthId = oauthId
-                if (user.avatarUrl == null) user.avatarUrl = avatarUrl
-                user.emailVerified = true
-                user.updatedAt = Instant.now()
+            // Do NOT auto-link by email — this is an account takeover vector.
+            // If an attacker controls an OAuth account with the victim's email they would
+            // silently gain access to the existing password account.
+            // Users must be authenticated to link an OAuth provider to an existing account.
+            val existing = userRepository.findByEmail(email.lowercase().trim())
+            if (existing != null) {
+                throw WebApplicationException(
+                    Response.status(409)
+                        .entity(mapOf(
+                            "error" to "conflict",
+                            "message" to "An account with this email already exists. Log in with your password and link $provider from account settings.",
+                            "status" to 409,
+                        ))
+                        .build()
+                )
             }
-        }
 
-        if (user == null) {
             user = UserEntity().apply {
                 id = generateId()
                 this.email = email.lowercase().trim()
@@ -212,7 +218,7 @@ class UserService @Inject constructor(
 
     private fun checkAppAccess(user: UserEntity, appId: String?) {
         if (appId == null) return
-        val app = appRepository.findById(appId) ?: return  // unknown app — allow (open)
+        val app = appRepository.findById(appId) ?: return
         if (app.requiresExplicitAccess && !accessRepository.hasAccess(user.id, appId)) {
             throw ForbiddenException("You do not have access to this application")
         }

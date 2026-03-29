@@ -18,7 +18,8 @@ quarkus:
     port: 8703
     cors:
       enabled: true
-      origins: "${AUTH_CORS_ORIGINS:*}"
+      # No wildcard default — must be set explicitly in production via AUTH_CORS_ORIGINS
+      origins: "${AUTH_CORS_ORIGINS:}"
       methods: GET,POST,DELETE,OPTIONS,HEAD,PUT,PATCH
       headers: accept,authorization,content-type,x-app-id,x-admin-key
       access-control-max-age: 24H
@@ -65,6 +66,11 @@ auth:
     key-hmac-secret: "test-hmac-secret-exactly-32-chars!!"
     rate-limit:
       enabled: false
+
+"%prod":
+  quarkus:
+    smallrye-openapi:
+      enable: false
 
 # No %prod datasource override — SQLite works fine for personal use in production.
 # To use PostgreSQL in prod, set these env vars at runtime (no rebuild needed):

@@ -12,6 +12,7 @@ import com.authservice.service.UserService
 import jakarta.inject.Inject
 import jakarta.transaction.Transactional
 import jakarta.validation.Valid
+import jakarta.ws.rs.BadRequestException
 import jakarta.ws.rs.Consumes
 import jakarta.ws.rs.DELETE
 import jakarta.ws.rs.GET
@@ -28,6 +29,7 @@ import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.eclipse.microprofile.openapi.annotations.Operation
 import org.eclipse.microprofile.openapi.annotations.tags.Tag
 import org.jboss.logging.Logger
+import java.net.URI
 import java.time.Instant
 import java.util.Optional
 
@@ -45,6 +47,11 @@ class AppResource @Inject constructor(
         private val log: Logger = Logger.getLogger(AppResource::class.java)
     }
 
+    // Pre-computed hash of the configured admin key — avoids re-hashing on every request
+    private val configuredKeyHash: String? by lazy {
+        adminKey.orElse(null)?.takeIf { it.isNotBlank() }?.let { hasher.hash(it) }
+    }
+
     // ── App CRUD ──────────────────────────────────────────────────────────────
 
     @POST
@@ -55,6 +62,7 @@ class AppResource @Inject constructor(
         @Valid body: CreateAppRequest,
     ): Response {
         checkAdmin(key)
+        body.redirectUris.forEach { validateRedirectUriScheme(it) }
         if (appRepository.findById(body.id) != null) {
             return Response.status(409).entity(mapOf("error" to "conflict", "message" to "App '${body.id}' already exists")).build()
         }
@@ -140,11 +148,24 @@ class AppResource @Inject constructor(
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun checkAdmin(provided: String?) {
-        val configured = adminKey.orElse(null)?.takeIf { it.isNotBlank() }
+        val storedHash = configuredKeyHash
             ?: throw NotSupportedException("Admin API is disabled — set AUTH_ADMIN_KEY to enable it")
         if (provided.isNullOrBlank()) throw NotAuthorizedException("Missing X-Admin-Key", "Admin")
-        if (!hasher.verify(provided, hasher.hash(configured))) {
+        if (!hasher.verify(provided, storedHash)) {
             throw NotAuthorizedException("Invalid X-Admin-Key", "Admin")
+        }
+    }
+
+    /** Reject redirect URIs that are not HTTPS (HTTP allowed for localhost only). */
+    private fun validateRedirectUriScheme(redirectUri: String) {
+        val uri = try { URI.create(redirectUri) } catch (e: Exception) {
+            throw BadRequestException("Invalid redirect URI format: $redirectUri")
+        }
+        val scheme = uri.scheme?.lowercase()
+        val host = uri.host?.lowercase() ?: ""
+        val isLocalhost = host == "localhost" || host == "127.0.0.1"
+        if (scheme != "https" && !(scheme == "http" && isLocalhost)) {
+            throw BadRequestException("redirect URI must use HTTPS (HTTP only allowed for localhost): $redirectUri")
         }
     }
 

@@ -7,7 +7,7 @@ import jakarta.inject.Inject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
-/** Fixed-window rate limiter — copied from DocBucket's RateLimiter. */
+/** Fixed-window rate limiter. */
 @ApplicationScoped
 class RateLimiter @Inject constructor(
     private val rateLimitConfig: RateLimitConfig,
@@ -17,7 +17,13 @@ class RateLimiter @Inject constructor(
     private val windows = ConcurrentHashMap<String, Window>()
     private val windowMs = 60_000L
 
-    fun tryAcquire(key: String): Boolean {
+    fun configuredRpm(): Int = rateLimitConfig.requestsPerMinute()
+
+    /** Acquire a slot against the configured global RPM limit. */
+    fun tryAcquire(key: String): Boolean = tryAcquire(key, rateLimitConfig.requestsPerMinute())
+
+    /** Acquire a slot against a custom per-key limit (used for per-account brute force protection). */
+    fun tryAcquire(key: String, maxRequests: Int): Boolean {
         if (!rateLimitConfig.enabled()) return true
         val now = System.currentTimeMillis()
         val window = windows.compute(key) { _, existing ->
@@ -27,7 +33,7 @@ class RateLimiter @Inject constructor(
                 existing
             }
         }!!
-        return window.count.incrementAndGet() <= rateLimitConfig.requestsPerMinute()
+        return window.count.incrementAndGet() <= maxRequests
     }
 
     @Scheduled(every = "2m")

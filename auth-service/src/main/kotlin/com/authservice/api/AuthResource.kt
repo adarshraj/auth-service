@@ -29,6 +29,7 @@ import jakarta.ws.rs.Path
 import jakarta.ws.rs.PathParam
 import jakarta.ws.rs.Produces
 import jakarta.ws.rs.QueryParam
+import jakarta.ws.rs.WebApplicationException
 import jakarta.ws.rs.container.ContainerRequestContext
 import jakarta.ws.rs.core.Context
 import jakarta.ws.rs.core.MediaType
@@ -57,6 +58,8 @@ class AuthResource @Inject constructor(
         private val log: Logger = Logger.getLogger(AuthResource::class.java)
         private val secureRandom = SecureRandom()
         private const val CODE_TTL_SECONDS = 60L
+        // Stricter per-account limit to defend against distributed brute force from multiple IPs
+        private const val PER_ACCOUNT_RPM = 10
     }
 
     // ── Register ──────────────────────────────────────────────────────────────
@@ -91,6 +94,8 @@ class AuthResource @Inject constructor(
         @Context ctx: ContainerRequestContext,
     ): AuthResponse {
         checkRateLimit(ctx)
+        // Per-account limit: catches distributed brute force that rotates IPs to bypass per-IP limit
+        checkRateLimit("auth:account:${body.email.lowercase().trim()}", PER_ACCOUNT_RPM)
         val user = userService.login(body.email, body.password, appId)
         val token = jwtService.sign(user.id, user.email, appId)
         return AuthResponse(token, user.toResponse())
@@ -164,7 +169,8 @@ class AuthResource @Inject constructor(
         if (error != null) throw BadRequestException("OAuth error: $error")
         if (code.isNullOrBlank()) throw BadRequestException("Missing OAuth code")
 
-        val (resolvedProvider, appId, redirectUri) = parseOAuthState(state, provider)
+        // State is mandatory — it encodes the provider and protects against CSRF
+        val (resolvedProvider, appId, redirectUri) = parseOAuthState(state)
 
         val oauthUser = when (resolvedProvider) {
             "google" -> oauthService.exchangeGoogleCode(code)
@@ -200,7 +206,9 @@ class AuthResource @Inject constructor(
     @Operation(summary = "Exchange a one-time OAuth code for a JWT (code valid for 60 seconds)")
     fun exchangeToken(
         @FormParam("code") @NotBlank code: String,
+        @Context ctx: ContainerRequestContext,
     ): AuthResponse {
+        checkRateLimit(ctx)
         val entity = oauthCodeRepository.findByCode(code)
             ?: throw BadRequestException("Invalid auth code")
         if (entity.used) throw BadRequestException("Auth code already used")
@@ -231,11 +239,17 @@ class AuthResource @Inject constructor(
     }
 
     private fun checkRateLimit(ctx: ContainerRequestContext) {
-        val ip = ctx.getHeaderString("X-Forwarded-For")?.split(",")?.first()?.trim()
+        // Take the rightmost (trusted proxy-set) IP from X-Forwarded-For to prevent spoofing
+        val ip = ctx.getHeaderString("X-Forwarded-For")
+            ?.split(",")?.last()?.trim()
             ?: ctx.getHeaderString("X-Real-IP")
             ?: "unknown"
-        if (!rateLimiter.tryAcquire("auth:ip:$ip")) {
-            throw jakarta.ws.rs.WebApplicationException(
+        checkRateLimit("auth:ip:$ip", rateLimiter.configuredRpm())
+    }
+
+    private fun checkRateLimit(key: String, maxRequests: Int) {
+        if (!rateLimiter.tryAcquire(key, maxRequests)) {
+            throw WebApplicationException(
                 Response.status(429)
                     .type(MediaType.APPLICATION_JSON)
                     .header("Retry-After", "60")
@@ -255,34 +269,36 @@ class AuthResource @Inject constructor(
             .encodeToString(parts.joinToString("\n").toByteArray())
     }
 
-    /** Decode provider + appId + redirectUri from state; fall back to query param for provider. */
-    private fun parseOAuthState(state: String?, fallbackProvider: String?): Triple<String, String?, String?> {
-        if (!state.isNullOrBlank()) {
-            try {
-                val decoded = String(java.util.Base64.getUrlDecoder().decode(state))
-                val parts = decoded.split("\n")
-                if (parts.size >= 3) {
-                    val p = parts[0].takeIf { it.isNotBlank() } ?: fallbackProvider ?: "google"
-                    val a = parts[1].takeIf { it.isNotBlank() }
-                    val r = parts.getOrNull(3)?.takeIf { it.isNotBlank() }
-                    return Triple(p, a, r)
-                }
-            } catch (_: Exception) {
-                // fall through to legacy format
-            }
-            // legacy plain-text state: "provider:appId:nonce"
-            val parts = state.split(":")
-            if (parts.size >= 2) {
-                val p = parts[0].takeIf { it.isNotBlank() } ?: fallbackProvider ?: "google"
-                val a = parts[1].takeIf { it.isNotBlank() }
-                return Triple(p, a, null)
-            }
+    /** Decode provider + appId + redirectUri from state.
+     *  State is mandatory — absence or invalid format is rejected to prevent CSRF. */
+    private fun parseOAuthState(state: String?): Triple<String, String?, String?> {
+        if (state.isNullOrBlank()) throw BadRequestException("Missing OAuth state parameter")
+        return try {
+            val decoded = String(java.util.Base64.getUrlDecoder().decode(state))
+            val parts = decoded.split("\n")
+            if (parts.size < 3) throw BadRequestException("Invalid OAuth state parameter")
+            val provider = parts[0].takeIf { it.isNotBlank() }
+                ?: throw BadRequestException("Invalid OAuth state parameter")
+            val appId = parts[1].takeIf { it.isNotBlank() }
+            val redirectUri = parts.getOrNull(3)?.takeIf { it.isNotBlank() }
+            Triple(provider, appId, redirectUri)
+        } catch (e: IllegalArgumentException) {
+            throw BadRequestException("Invalid OAuth state parameter")
         }
-        return Triple(fallbackProvider ?: "google", null, null)
     }
 
-    /** Validate that the given redirect URI is registered for the app. */
+    /** Validate that the redirect URI is HTTPS (HTTP allowed for localhost only) and registered for the app. */
     private fun validateRedirectUri(redirectUri: String, appId: String?) {
+        val uri = try { URI.create(redirectUri) } catch (e: Exception) {
+            throw BadRequestException("Invalid redirect_uri format")
+        }
+        val scheme = uri.scheme?.lowercase()
+        val host = uri.host?.lowercase() ?: ""
+        val isLocalhost = host == "localhost" || host == "127.0.0.1"
+        if (scheme != "https" && !(scheme == "http" && isLocalhost)) {
+            throw BadRequestException("redirect_uri must use HTTPS (HTTP only allowed for localhost)")
+        }
+
         if (appId == null) throw BadRequestException("redirect_uri requires X-App-Id")
         val app = appRepository.findById(appId)
             ?: throw BadRequestException("Unknown app: $appId")

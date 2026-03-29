@@ -7,12 +7,14 @@ import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import jakarta.ws.rs.BadRequestException
 import org.eclipse.microprofile.config.inject.ConfigProperty
+import org.jboss.logging.Logger
 import java.net.URI
 import java.net.URLEncoder
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets
+import java.time.Duration
 
 /**
  * Google and GitHub OAuth flows.
@@ -23,7 +25,15 @@ class OAuthService @Inject constructor(
     private val oauthConfig: OAuthConfig,
     @ConfigProperty(name = "auth.base-url", defaultValue = "http://localhost:8703") private val baseUrl: String,
 ) {
-    private val http = HttpClient.newHttpClient()
+    companion object {
+        private val log: Logger = Logger.getLogger(OAuthService::class.java)
+        private val CONNECT_TIMEOUT = Duration.ofSeconds(10)
+        private val REQUEST_TIMEOUT = Duration.ofSeconds(15)
+    }
+
+    private val http = HttpClient.newBuilder()
+        .connectTimeout(CONNECT_TIMEOUT)
+        .build()
     private val mapper = ObjectMapper()
 
     data class OAuthUser(
@@ -96,8 +106,7 @@ class OAuthService @Inject constructor(
             "code" to code,
         ))
 
-        val tokenRes = postJson("https://github.com/login/oauth/access_token", tokenBody,
-            acceptJson = true)
+        val tokenRes = post("https://github.com/login/oauth/access_token", tokenBody, "application/json")
         val accessToken = tokenRes["access_token"]?.asText()
             ?: throw BadRequestException("GitHub token exchange failed")
 
@@ -130,22 +139,28 @@ class OAuthService @Inject constructor(
             .POST(HttpRequest.BodyPublishers.ofString(body))
             .header("Content-Type", contentType)
             .header("Accept", "application/json")
+            .timeout(REQUEST_TIMEOUT)
             .build()
         val res = http.send(req, HttpResponse.BodyHandlers.ofString())
-        if (res.statusCode() >= 400) throw BadRequestException("OAuth request failed: ${res.body()}")
+        if (res.statusCode() >= 400) {
+            // Log detail server-side; never forward raw provider error to the client
+            log.warnf("OAuth POST to %s failed with status %d: %s", url, res.statusCode(), res.body())
+            throw BadRequestException("OAuth request failed")
+        }
         return mapper.readTree(res.body())
     }
-
-    private fun postJson(url: String, body: String, acceptJson: Boolean): JsonNode =
-        post(url, body, "application/json")
 
     private fun get(url: String, bearerToken: String): JsonNode {
         val req = HttpRequest.newBuilder(URI.create(url))
             .GET()
             .header("Authorization", "Bearer $bearerToken")
+            .timeout(REQUEST_TIMEOUT)
             .build()
         val res = http.send(req, HttpResponse.BodyHandlers.ofString())
-        if (res.statusCode() >= 400) throw BadRequestException("OAuth userinfo failed: ${res.body()}")
+        if (res.statusCode() >= 400) {
+            log.warnf("OAuth GET to %s failed with status %d: %s", url, res.statusCode(), res.body())
+            throw BadRequestException("OAuth userinfo request failed")
+        }
         return mapper.readTree(res.body())
     }
 
@@ -154,9 +169,13 @@ class OAuthService @Inject constructor(
             .GET()
             .header("Authorization", "Bearer $bearerToken")
             .header("Accept", "application/vnd.github.v3+json")
+            .timeout(REQUEST_TIMEOUT)
             .build()
         val res = http.send(req, HttpResponse.BodyHandlers.ofString())
-        if (res.statusCode() >= 400) throw BadRequestException("GitHub API failed: ${res.body()}")
+        if (res.statusCode() >= 400) {
+            log.warnf("GitHub API GET to %s failed with status %d: %s", url, res.statusCode(), res.body())
+            throw BadRequestException("GitHub API request failed")
+        }
         return mapper.readTree(res.body())
     }
 
