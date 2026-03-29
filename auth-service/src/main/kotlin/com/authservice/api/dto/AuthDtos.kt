@@ -8,6 +8,8 @@ import jakarta.validation.constraints.Size
 
 data class RegisterRequest(
     @field:NotBlank @field:Email val email: String = "",
+    // password is intentionally optional — supports OAuth-only accounts created via the OAuth flow.
+    // Callers registering a password account must supply a value; bcrypt validation is in PasswordService.
     @field:Size(min = 8, message = "Password must be at least 8 characters") val password: String? = null,
     val name: String? = null,
 )

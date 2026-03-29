@@ -15,6 +15,10 @@ data class CreateAppRequest(
 )
 
 data class GrantAccessRequest(
+    @field:jakarta.validation.constraints.Pattern(
+        regexp = "[a-z][a-z0-9_-]{0,49}",
+        message = "Role must start with a letter and contain only lowercase alphanumeric, hyphens, or underscores (max 50 chars)"
+    )
     val role: String = "user",
 )
 

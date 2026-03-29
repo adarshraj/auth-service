@@ -7,6 +7,7 @@ import com.authservice.api.dto.UserResponse
 import com.authservice.domain.AppRepository
 import com.authservice.domain.OAuthCodeEntity
 import com.authservice.domain.OAuthCodeRepository
+import com.authservice.security.ApiKeyHasher
 import com.authservice.security.CallerContext
 import com.authservice.security.JwtFilter
 import com.authservice.security.RateLimiter
@@ -34,6 +35,7 @@ import jakarta.ws.rs.container.ContainerRequestContext
 import jakarta.ws.rs.core.Context
 import jakarta.ws.rs.core.MediaType
 import jakarta.ws.rs.core.Response
+import jakarta.ws.rs.core.UriBuilder
 import org.eclipse.microprofile.openapi.annotations.Operation
 import org.eclipse.microprofile.openapi.annotations.tags.Tag
 import org.jboss.logging.Logger
@@ -53,6 +55,7 @@ class AuthResource @Inject constructor(
     private val rateLimiter: RateLimiter,
     private val appRepository: AppRepository,
     private val oauthCodeRepository: OAuthCodeRepository,
+    private val apiKeyHasher: ApiKeyHasher,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(AuthResource::class.java)
@@ -189,7 +192,8 @@ class AuthResource @Inject constructor(
 
         return if (redirectUri != null) {
             val authCode = issueOAuthCode(user.id, user.email, appId)
-            val location = URI.create("$redirectUri?code=$authCode")
+            // UriBuilder handles existing query params (appends & when needed) and percent-encodes values
+            val location = UriBuilder.fromUri(redirectUri).queryParam("code", authCode).build()
             Response.temporaryRedirect(location).build()
         } else {
             val token = jwtService.sign(user.id, user.email, appId)
@@ -259,22 +263,32 @@ class AuthResource @Inject constructor(
         }
     }
 
-    /** Encode provider + appId + redirectUri into the OAuth state param.
-     *  Format: base64url(provider\nappId\nnonce[\nredirectUri]) */
+    /** Encode provider + appId + redirectUri into a signed OAuth state param.
+     *  Format: base64url(provider\nappId\nnonce[\nredirectUri])~hmac
+     *  The HMAC signature prevents tampering with state in-flight (e.g. open redirect via redirectUri swap). */
     private fun buildOAuthState(provider: String, appId: String?, redirectUri: String?): String {
         val nonce = ByteArray(16).also { secureRandom.nextBytes(it) }
             .joinToString("") { "%02x".format(it) }
         val parts = listOfNotNull(provider, appId ?: "", nonce, redirectUri)
-        return java.util.Base64.getUrlEncoder().withoutPadding()
+        val payload = java.util.Base64.getUrlEncoder().withoutPadding()
             .encodeToString(parts.joinToString("\n").toByteArray())
+        val sig = apiKeyHasher.hash(payload)
+        return "$payload~$sig"
     }
 
-    /** Decode provider + appId + redirectUri from state.
-     *  State is mandatory — absence or invalid format is rejected to prevent CSRF. */
+    /** Decode and verify a signed OAuth state param. Rejects missing, tampered, or malformed state. */
     private fun parseOAuthState(state: String?): Triple<String, String?, String?> {
         if (state.isNullOrBlank()) throw BadRequestException("Missing OAuth state parameter")
+        val tildeIdx = state.lastIndexOf('~')
+        if (tildeIdx < 0) throw BadRequestException("Invalid OAuth state parameter")
+
+        val payload = state.substring(0, tildeIdx)
+        val sig = state.substring(tildeIdx + 1)
+        // Constant-time comparison to prevent timing attacks on state forgery
+        if (!apiKeyHasher.verify(payload, sig)) throw BadRequestException("Invalid OAuth state signature")
+
         return try {
-            val decoded = String(java.util.Base64.getUrlDecoder().decode(state))
+            val decoded = String(java.util.Base64.getUrlDecoder().decode(payload))
             val parts = decoded.split("\n")
             if (parts.size < 3) throw BadRequestException("Invalid OAuth state parameter")
             val provider = parts[0].takeIf { it.isNotBlank() }

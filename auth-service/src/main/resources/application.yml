@@ -20,6 +20,9 @@ quarkus:
       enabled: true
       # No wildcard default — must be set explicitly in production via AUTH_CORS_ORIGINS
       origins: "${AUTH_CORS_ORIGINS:}"
+      # Rate limiting reads X-Forwarded-For (rightmost entry) for the real client IP.
+      # Ensure your reverse proxy (nginx/caddy/traefik) sets this header and strips
+      # any client-supplied X-Forwarded-For values before forwarding to this service.
       methods: GET,POST,DELETE,OPTIONS,HEAD,PUT,PATCH
       headers: accept,authorization,content-type,x-app-id,x-admin-key
       access-control-max-age: 24H

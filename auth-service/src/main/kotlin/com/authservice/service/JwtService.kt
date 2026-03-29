@@ -20,6 +20,7 @@ import java.util.Date
 class JwtService @Inject constructor(
     private val ecKeyService: EcKeyService,
     @ConfigProperty(name = "auth.jwt.expiry-seconds", defaultValue = "604800") private val expirySeconds: Long,
+    @ConfigProperty(name = "auth.base-url", defaultValue = "http://localhost:8703") private val baseUrl: String,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(JwtService::class.java)
@@ -36,6 +37,7 @@ class JwtService @Inject constructor(
         val exp = now + expirySeconds * 1000L
         val builder = Jwts.builder()
             .header().keyId(ecKeyService.kid).and()
+            .issuer(baseUrl)
             .subject(userId)
             .claim("userId", userId)
             .claim("email", email)

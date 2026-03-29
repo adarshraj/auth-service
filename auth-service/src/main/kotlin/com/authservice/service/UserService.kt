@@ -8,6 +8,7 @@ import com.authservice.domain.UserAppAccessId
 import com.authservice.domain.UserAppAccessRepository
 import com.authservice.domain.UserEntity
 import com.authservice.domain.UserRepository
+import com.authservice.security.ApiKeyHasher
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import jakarta.transaction.Transactional
@@ -29,6 +30,7 @@ class UserService @Inject constructor(
     private val accessRepository: UserAppAccessRepository,
     private val authTokenRepository: AuthTokenRepository,
     private val passwordService: PasswordService,
+    private val apiKeyHasher: ApiKeyHasher,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(UserService::class.java)
@@ -189,23 +191,24 @@ class UserService @Inject constructor(
 
     @Transactional
     fun createAuthToken(userId: String, type: String, expiresInHours: Long): String {
-        val token = generateToken()
+        val rawToken = generateToken()
+        // Store only the HMAC of the token — a DB dump does not expose active secrets
         val entity = AuthTokenEntity().apply {
             id = generateId()
             this.userId = userId
-            this.token = token
+            this.token = apiKeyHasher.hash(rawToken)
             this.type = type
             this.expiresAt = Instant.now().plus(expiresInHours, ChronoUnit.HOURS)
             this.used = false
             this.createdAt = Instant.now()
         }
         authTokenRepository.persist(entity)
-        return token
+        return rawToken
     }
 
     @Transactional
-    fun consumeAuthToken(token: String, expectedType: String): String {
-        val entity = authTokenRepository.findByToken(token)
+    fun consumeAuthToken(rawToken: String, expectedType: String): String {
+        val entity = authTokenRepository.findByToken(apiKeyHasher.hash(rawToken))
             ?: throw BadRequestException("Invalid token")
         if (entity.used) throw BadRequestException("Token already used")
         if (entity.type != expectedType) throw BadRequestException("Invalid token type")
