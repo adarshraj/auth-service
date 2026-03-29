@@ -27,8 +27,6 @@ quarkus:
 
 auth:
   jwt:
-    # Shared HS256 secret — must match JWT_SECRET in all services that verify tokens (ai-wrap, etc.)
-    secret: ${JWT_SECRET:}
     # Token expiry in seconds. Default 7 days.
     expiry-seconds: ${AUTH_JWT_EXPIRY_SECONDS:604800}
   admin-key: ${AUTH_ADMIN_KEY:}
@@ -63,8 +61,6 @@ auth:
     otel:
       enabled: false
   auth:
-    jwt:
-      secret: "test-jwt-secret-at-least-32-chars!!"
     admin-key: test-admin-key
     key-hmac-secret: "test-hmac-secret-exactly-32-chars!!"
     rate-limit:

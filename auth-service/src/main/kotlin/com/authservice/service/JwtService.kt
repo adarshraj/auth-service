@@ -2,31 +2,27 @@ package com.authservice.service
 
 import io.jsonwebtoken.JwtException
 import io.jsonwebtoken.Jwts
-import io.jsonwebtoken.security.Keys
 import jakarta.enterprise.context.ApplicationScoped
+import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.jboss.logging.Logger
-import java.nio.charset.StandardCharsets
 import java.util.Date
 
 /**
- * JWT sign/verify using HS256. Token payload matches finance-tracker's format:
- *   { sub, userId, email, appId, iat, exp }
+ * JWT sign/verify using ES256 (ECDSA P-256).
+ * Token payload: { sub, userId, email, appId, aud, iat, exp }
  *
- * The `sub` field is set to userId so ai-wrap (and any other service sharing JWT_SECRET)
- * can identify the caller without knowing about finance-tracker's custom `userId` field.
+ * The public key is published at /.well-known/jwks.json so consuming services
+ * can verify tokens without sharing a secret.
+ * The `aud` claim is set to appId so each app can reject tokens scoped to other apps.
  */
 @ApplicationScoped
-class JwtService(
-    @ConfigProperty(name = "auth.jwt.secret") private val jwtSecret: String,
+class JwtService @Inject constructor(
+    private val ecKeyService: EcKeyService,
     @ConfigProperty(name = "auth.jwt.expiry-seconds", defaultValue = "604800") private val expirySeconds: Long,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(JwtService::class.java)
-    }
-
-    private val signingKey by lazy {
-        Keys.hmacShaKeyFor(jwtSecret.toByteArray(StandardCharsets.UTF_8))
     }
 
     data class Claims(
@@ -39,19 +35,23 @@ class JwtService(
         val now = System.currentTimeMillis()
         val exp = now + expirySeconds * 1000L
         val builder = Jwts.builder()
+            .header().keyId(ecKeyService.kid).and()
             .subject(userId)
             .claim("userId", userId)
             .claim("email", email)
             .issuedAt(Date(now))
             .expiration(Date(exp))
-        if (appId != null) builder.claim("appId", appId)
-        return builder.signWith(signingKey).compact()
+        if (appId != null) {
+            builder.claim("appId", appId)
+            builder.audience().add(appId)
+        }
+        return builder.signWith(ecKeyService.privateKey).compact()
     }
 
     fun verify(token: String): Claims? {
         return try {
             val claims = Jwts.parser()
-                .verifyWith(signingKey)
+                .verifyWith(ecKeyService.publicKey)
                 .build()
                 .parseSignedClaims(token)
                 .payload

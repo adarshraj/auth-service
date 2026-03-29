@@ -5,6 +5,8 @@ import com.authservice.api.dto.LoginRequest
 import com.authservice.api.dto.RegisterRequest
 import com.authservice.api.dto.UserResponse
 import com.authservice.domain.AppRepository
+import com.authservice.domain.OAuthCodeEntity
+import com.authservice.domain.OAuthCodeRepository
 import com.authservice.security.CallerContext
 import com.authservice.security.JwtFilter
 import com.authservice.security.RateLimiter
@@ -12,10 +14,13 @@ import com.authservice.service.JwtService
 import com.authservice.service.OAuthService
 import com.authservice.service.UserService
 import jakarta.inject.Inject
+import jakarta.transaction.Transactional
 import jakarta.validation.Valid
+import jakarta.validation.constraints.NotBlank
 import jakarta.ws.rs.BadRequestException
 import jakarta.ws.rs.Consumes
 import jakarta.ws.rs.DELETE
+import jakarta.ws.rs.FormParam
 import jakarta.ws.rs.GET
 import jakarta.ws.rs.HeaderParam
 import jakarta.ws.rs.NotAuthorizedException
@@ -28,12 +33,13 @@ import jakarta.ws.rs.container.ContainerRequestContext
 import jakarta.ws.rs.core.Context
 import jakarta.ws.rs.core.MediaType
 import jakarta.ws.rs.core.Response
-import jakarta.ws.rs.core.UriInfo
 import org.eclipse.microprofile.openapi.annotations.Operation
 import org.eclipse.microprofile.openapi.annotations.tags.Tag
 import org.jboss.logging.Logger
 import java.net.URI
 import java.security.SecureRandom
+import java.time.Instant
+import java.util.UUID
 
 @Path("/auth")
 @Produces(MediaType.APPLICATION_JSON)
@@ -45,10 +51,12 @@ class AuthResource @Inject constructor(
     private val oauthService: OAuthService,
     private val rateLimiter: RateLimiter,
     private val appRepository: AppRepository,
+    private val oauthCodeRepository: OAuthCodeRepository,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(AuthResource::class.java)
         private val secureRandom = SecureRandom()
+        private const val CODE_TTL_SECONDS = 60L
     }
 
     // ── Register ──────────────────────────────────────────────────────────────
@@ -145,7 +153,8 @@ class AuthResource @Inject constructor(
 
     @GET
     @Path("/oauth/callback")
-    @Operation(summary = "OAuth callback — exchange code for JWT; redirects to redirect_uri if present in state")
+    @Transactional
+    @Operation(summary = "OAuth callback — issues a short-lived code; redirects to redirect_uri?code= if present, else returns JSON")
     fun oauthCallback(
         @QueryParam("provider") provider: String?,
         @QueryParam("code") code: String?,
@@ -171,17 +180,55 @@ class AuthResource @Inject constructor(
             avatarUrl = oauthUser.avatarUrl,
             appId = appId,
         )
-        val token = jwtService.sign(user.id, user.email, appId)
 
         return if (redirectUri != null) {
-            val location = URI.create("$redirectUri#token=$token")
+            val authCode = issueOAuthCode(user.id, user.email, appId)
+            val location = URI.create("$redirectUri?code=$authCode")
             Response.temporaryRedirect(location).build()
         } else {
+            val token = jwtService.sign(user.id, user.email, appId)
             Response.ok(AuthResponse(token, user.toResponse())).build()
         }
     }
 
+    // ── Token exchange ────────────────────────────────────────────────────────
+
+    @POST
+    @Path("/token")
+    @Consumes(MediaType.APPLICATION_FORM_URLENCODED)
+    @Transactional
+    @Operation(summary = "Exchange a one-time OAuth code for a JWT (code valid for 60 seconds)")
+    fun exchangeToken(
+        @FormParam("code") @NotBlank code: String,
+    ): AuthResponse {
+        val entity = oauthCodeRepository.findByCode(code)
+            ?: throw BadRequestException("Invalid auth code")
+        if (entity.used) throw BadRequestException("Auth code already used")
+        if (Instant.now().isAfter(entity.expiresAt)) throw BadRequestException("Auth code expired")
+        entity.used = true
+
+        val token = jwtService.sign(entity.userId, entity.email, entity.appId)
+        val user = userService.getById(entity.userId)
+        return AuthResponse(token, user.toResponse())
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private fun issueOAuthCode(userId: String, email: String, appId: String?): String {
+        val code = ByteArray(32).also { secureRandom.nextBytes(it) }
+            .joinToString("") { "%02x".format(it) }
+        oauthCodeRepository.persist(OAuthCodeEntity().apply {
+            id = UUID.randomUUID().toString()
+            this.code = code
+            this.userId = userId
+            this.email = email
+            this.appId = appId
+            expiresAt = Instant.now().plusSeconds(CODE_TTL_SECONDS)
+            used = false
+            createdAt = Instant.now()
+        })
+        return code
+    }
 
     private fun checkRateLimit(ctx: ContainerRequestContext) {
         val ip = ctx.getHeaderString("X-Forwarded-For")?.split(",")?.first()?.trim()
@@ -199,8 +246,7 @@ class AuthResource @Inject constructor(
     }
 
     /** Encode provider + appId + redirectUri into the OAuth state param.
-     *  Format: base64(provider\nappId\nnonce[\nredirectUri])
-     *  Using newline as delimiter inside base64 avoids collision with URL-special chars in redirectUri. */
+     *  Format: base64url(provider\nappId\nnonce[\nredirectUri]) */
     private fun buildOAuthState(provider: String, appId: String?, redirectUri: String?): String {
         val nonce = ByteArray(16).also { secureRandom.nextBytes(it) }
             .joinToString("") { "%02x".format(it) }
