@@ -76,9 +76,32 @@ Layered under `src/main/kotlin/com/authservice/`:
 
 ### Admin key security
 
-The `X-Admin-Key` header value is never stored raw. Comparison works by hashing both the provided value and the configured value with the same HMAC secret, then comparing the hashes via `MessageDigest.isEqual()` (constant-time). This prevents timing attacks on key comparison.
+The `X-Admin-Key` header value is never stored raw. The hash of the configured key is pre-computed once at startup (`AppResource.configuredKeyHash` lazy val). On each request `ApiKeyHasher.verify(provided, storedHash)` computes `HMAC(provided)` and compares via `MessageDigest.isEqual()` (constant-time). This prevents both timing attacks and repeated hashing overhead.
 
 **Admin API is disabled** (returns 501) if `AUTH_ADMIN_KEY` is not set. Apps still work — only the `/auth/apps` management endpoints are gated.
+
+### Auth token security
+
+`auth_tokens` (password-reset / magic-link / email-verification) are stored as `HMAC(token, AUTH_KEY_HMAC_SECRET)`, not plaintext. `UserService.createAuthToken()` returns the raw token to the caller; `consumeAuthToken()` hashes the incoming value before lookup. A full DB dump does not expose redeemable tokens.
+
+### OAuth state integrity
+
+The OAuth state parameter is HMAC-signed: `base64url(payload)~hmac_hex`. `AuthResource.buildOAuthState()` appends the signature; `parseOAuthState()` verifies it with constant-time comparison before decoding. This prevents an attacker from swapping the `redirectUri` field in-flight (open redirect) or injecting a provider value.
+
+### Rate limiting and reverse proxy
+
+Rate limiting uses the **rightmost** `X-Forwarded-For` entry (set by the trusted reverse proxy) to prevent client-side IP spoofing. For this to be effective your reverse proxy must:
+1. Strip any client-supplied `X-Forwarded-For` header before forwarding.
+2. Append the real client IP itself.
+
+Login is rate-limited twice: per-IP (global RPM from config) and per-account (hard-coded 10 RPM) to defend against distributed brute force from multiple IPs.
+
+### Redirect URI policy
+
+Redirect URIs are validated at both registration time (`POST /auth/apps`) and use time (`GET /auth/oauth/{provider}?redirect_uri=`). Rules:
+- Must be `https://` in production.
+- `http://localhost` and `http://127.0.0.1` are allowed for local development.
+- Must exactly match a URI registered for the app — no prefix matching.
 
 ### EC key pair lifecycle
 
@@ -128,13 +151,20 @@ The `X-Admin-Key` header value is never stored raw. Comparison works by hashing 
 
 ## JWT format
 
-`JwtService.sign()` sets both `sub = userId` and `userId = userId` in the payload:
-- `sub` — standard claim used by any JWT-aware service to identify the caller.
-- `userId` — custom claim for backward compatibility with finance-tracker.
-- `aud` — set to `appId` when present; consuming services should validate this to prevent cross-app token reuse.
-- `kid` — key ID in the header; matches the `kid` in the JWKS response.
+`JwtService.sign()` sets the following in the payload:
+- `sub` — userId; standard claim used by any JWT-aware service to identify the caller.
+- `userId` — same as `sub`; custom claim for backward compatibility with finance-tracker.
+- `email` — user's email address.
+- `iss` — issuer, set to `auth.base-url` (e.g. `https://auth.example.com`). Consuming services should validate this.
+- `aud` — set to `appId` when present. Consuming services **must** validate this to prevent cross-app token reuse. Tokens without `aud` are app-agnostic (issued without `X-App-Id`).
+- `kid` — key ID in the JWT header; matches the `kid` field in the JWKS response. Re-fetch JWKS when you encounter an unknown `kid`.
+- `iat` / `exp` — issued-at and expiry timestamps.
 
 Tokens are signed with ES256 (ECDSA P-256). Verify using the public key from `GET /.well-known/jwks.json`.
+
+**Consuming services should validate:** `iss` equals their known auth-service URL, `aud` equals their app ID, `exp` is in the future, and `kid` matches a known key in the JWKS.
+
+**Note on tokens without `aud`:** Tokens issued via login/register without `X-App-Id` have no `aud` claim. They are broadly usable across any service that trusts this auth-service. Avoid issuing these in multi-tenant contexts — always pass `X-App-Id`.
 
 ## Why ES256 and not RS256
 

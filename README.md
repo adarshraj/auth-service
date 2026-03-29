@@ -67,10 +67,13 @@ GET /.well-known/jwks.json
 ```
 
 Verify the token signature using the EC P-256 public key (`alg: ES256`). Also validate:
+- `iss` equals your known auth-service URL (e.g. `https://auth.example.com`)
 - `aud` matches your app ID (prevents accepting tokens issued for other apps)
 - `exp` is in the future
 
 No shared secret is needed. If the key pair is rotated, the `kid` field changes — re-fetch JWKS when you encounter an unknown `kid`.
+
+> **Tokens without `aud`:** Tokens issued without `X-App-Id` have no `aud` claim and are broadly usable. Always pass `X-App-Id` in login/register/OAuth flows to scope tokens to your app.
 
 ## Running locally
 
@@ -166,6 +169,21 @@ RS256 (RSA + SHA-256) was considered but not implemented due to **performance co
 
 ES256 provides stronger security with significantly less CPU cost at signing time. If requirements change, the switch is isolated to ~20 lines in `EcKeyService` — no API, DB schema, or consumer-side changes needed beyond updating the JWK type.
 
+## Security model
+
+| Mechanism | Detail |
+|---|---|
+| JWT signing | ES256 (ECDSA P-256); private key persisted in DB, never leaves the process |
+| Token audience | `aud` claim set to `appId`; consuming services must validate to prevent cross-app reuse |
+| Token issuer | `iss` claim set to `AUTH_BASE_URL`; consuming services should validate |
+| Auth tokens at rest | Password-reset / magic-link tokens stored as `HMAC(token)` — plaintext never written to DB |
+| OAuth state | HMAC-signed (`payload~sig`) to prevent redirectUri tampering in-flight |
+| Admin key | Stored as HMAC hash, compared constant-time; hash pre-computed at startup |
+| Rate limiting | Per-IP (configurable RPM) + per-account (10 RPM) on login to block distributed brute force |
+| Redirect URIs | HTTPS enforced; validated at registration and at use time; exact-match only |
+| OAuth account linking | Not automatic — requires authenticated link flow to prevent email-based account takeover |
+| OpenAPI/Swagger | Disabled in `prod` profile |
+
 ## Migrating consuming services from HS256
 
 Services that previously verified JWTs using `JWT_SECRET` need to be updated:
@@ -173,4 +191,5 @@ Services that previously verified JWTs using `JWT_SECRET` need to be updated:
 1. Remove `JWT_SECRET` usage.
 2. Fetch the public key from `GET /.well-known/jwks.json`.
 3. Verify tokens using ES256 with the EC P-256 public key.
-4. Validate the `aud` claim matches your app ID.
+4. Validate `iss` equals your auth-service URL.
+5. Validate `aud` matches your app ID.
