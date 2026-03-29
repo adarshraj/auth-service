@@ -80,9 +80,9 @@ The `X-Admin-Key` header value is never stored raw. The hash of the configured k
 
 **Admin API is disabled** (returns 501) if `AUTH_ADMIN_KEY` is not set. Apps still work — only the `/auth/apps` management endpoints are gated.
 
-### Auth token security
+### Auth token and OAuth code security
 
-`auth_tokens` (password-reset / magic-link / email-verification) are stored as `HMAC(token, AUTH_KEY_HMAC_SECRET)`, not plaintext. `UserService.createAuthToken()` returns the raw token to the caller; `consumeAuthToken()` hashes the incoming value before lookup. A full DB dump does not expose redeemable tokens.
+`auth_tokens` and `oauth_codes` are stored as `HMAC(value, AUTH_TOKEN_PEPPER)`, not plaintext. `UserService.createAuthToken()` and `AuthResource.issueOAuthCode()` return the raw value to the caller and store only the hash; lookup hashes the incoming value before querying. A full DB dump does not expose redeemable tokens or codes.
 
 ### OAuth state integrity
 
@@ -114,6 +114,8 @@ Redirect URIs are validated at both registration time (`POST /auth/apps`) and us
 | `auth.jwt.expiry-seconds` | `AUTH_JWT_EXPIRY_SECONDS` | Token TTL (default 604800 = 7 days) |
 | `auth.admin-key` | `AUTH_ADMIN_KEY` | Key for `/auth/apps` endpoints (optional — disables app mgmt if unset) |
 | `auth.key-hmac-secret` | `AUTH_KEY_HMAC_SECRET` | HMAC-SHA256 secret for admin key hashing (min 32 chars, required in prod) |
+| `auth.state-hmac-secret` | `AUTH_STATE_HMAC_SECRET` | HMAC secret for signing OAuth state params (prevents open redirect / CSRF; required in prod) |
+| `auth.token-pepper` | `AUTH_TOKEN_PEPPER` | HMAC pepper for storing auth tokens and OAuth codes at rest (required in prod) |
 | `auth.rate-limit.enabled` | `AUTH_RATE_LIMIT_ENABLED` | Toggle rate limiting (default true) |
 | `auth.rate-limit.requests-per-minute` | `AUTH_RATE_LIMIT_RPM` | Per-IP limit (default 60) |
 | `auth.oauth.google.client-id` | `GOOGLE_CLIENT_ID` | Google OAuth |
@@ -125,7 +127,7 @@ Redirect URIs are validated at both registration time (`POST /auth/apps`) and us
 | `quarkus.datasource.username` | `QUARKUS_DATASOURCE_USERNAME` | DB username (prod only) |
 | `quarkus.datasource.password` | `QUARKUS_DATASOURCE_PASSWORD` | DB password (prod only) |
 
-**Dev profile:** SQLite at `./authservice-dev.db`. **Test profile:** In-memory SQLite, rate limiting disabled. **Prod profile:** SQLite by default — mount a persistent volume for the `.db` file. `StartupGuard` throws on boot if HMAC secret is the default dev value. PostgreSQL is supported but optional.
+**Dev profile:** SQLite at `./authservice-dev.db`. **Test profile:** In-memory SQLite, rate limiting disabled. **Prod profile:** SQLite by default — mount a persistent volume for the `.db` file. `StartupGuard` throws on boot if any of the three HMAC secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`) are at their default dev values. PostgreSQL is supported but optional.
 
 ## Code patterns
 

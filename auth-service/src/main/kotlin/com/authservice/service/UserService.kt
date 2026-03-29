@@ -8,7 +8,7 @@ import com.authservice.domain.UserAppAccessId
 import com.authservice.domain.UserAppAccessRepository
 import com.authservice.domain.UserEntity
 import com.authservice.domain.UserRepository
-import com.authservice.security.ApiKeyHasher
+import com.authservice.security.Hmac
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import jakarta.transaction.Transactional
@@ -18,6 +18,7 @@ import jakarta.ws.rs.NotFoundException
 import jakarta.ws.rs.NotAuthorizedException
 import jakarta.ws.rs.WebApplicationException
 import jakarta.ws.rs.core.Response
+import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.jboss.logging.Logger
 import java.security.SecureRandom
 import java.time.Instant
@@ -30,7 +31,7 @@ class UserService @Inject constructor(
     private val accessRepository: UserAppAccessRepository,
     private val authTokenRepository: AuthTokenRepository,
     private val passwordService: PasswordService,
-    private val apiKeyHasher: ApiKeyHasher,
+    @ConfigProperty(name = "auth.token-pepper") private val tokenPepper: String,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(UserService::class.java)
@@ -196,7 +197,7 @@ class UserService @Inject constructor(
         val entity = AuthTokenEntity().apply {
             id = generateId()
             this.userId = userId
-            this.token = apiKeyHasher.hash(rawToken)
+            this.token = Hmac.sha256(rawToken, tokenPepper)
             this.type = type
             this.expiresAt = Instant.now().plus(expiresInHours, ChronoUnit.HOURS)
             this.used = false
@@ -208,7 +209,7 @@ class UserService @Inject constructor(
 
     @Transactional
     fun consumeAuthToken(rawToken: String, expectedType: String): String {
-        val entity = authTokenRepository.findByToken(apiKeyHasher.hash(rawToken))
+        val entity = authTokenRepository.findByToken(Hmac.sha256(rawToken, tokenPepper))
             ?: throw BadRequestException("Invalid token")
         if (entity.used) throw BadRequestException("Token already used")
         if (entity.type != expectedType) throw BadRequestException("Invalid token type")

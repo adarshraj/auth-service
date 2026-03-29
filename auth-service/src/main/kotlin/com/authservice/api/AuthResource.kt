@@ -7,8 +7,8 @@ import com.authservice.api.dto.UserResponse
 import com.authservice.domain.AppRepository
 import com.authservice.domain.OAuthCodeEntity
 import com.authservice.domain.OAuthCodeRepository
-import com.authservice.security.ApiKeyHasher
 import com.authservice.security.CallerContext
+import com.authservice.security.Hmac
 import com.authservice.security.JwtFilter
 import com.authservice.security.RateLimiter
 import com.authservice.service.JwtService
@@ -36,6 +36,7 @@ import jakarta.ws.rs.core.Context
 import jakarta.ws.rs.core.MediaType
 import jakarta.ws.rs.core.Response
 import jakarta.ws.rs.core.UriBuilder
+import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.eclipse.microprofile.openapi.annotations.Operation
 import org.eclipse.microprofile.openapi.annotations.tags.Tag
 import org.jboss.logging.Logger
@@ -55,7 +56,9 @@ class AuthResource @Inject constructor(
     private val rateLimiter: RateLimiter,
     private val appRepository: AppRepository,
     private val oauthCodeRepository: OAuthCodeRepository,
-    private val apiKeyHasher: ApiKeyHasher,
+    // Purpose-specific secrets — each has its own env var to limit blast radius if one leaks
+    @ConfigProperty(name = "auth.state-hmac-secret") private val stateHmacSecret: String,
+    @ConfigProperty(name = "auth.token-pepper") private val tokenPepper: String,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(AuthResource::class.java)
@@ -213,7 +216,8 @@ class AuthResource @Inject constructor(
         @Context ctx: ContainerRequestContext,
     ): AuthResponse {
         checkRateLimit(ctx)
-        val entity = oauthCodeRepository.findByCode(code)
+        // Lookup by HMAC of code — plaintext never stored in DB
+        val entity = oauthCodeRepository.findByCode(Hmac.sha256(code, tokenPepper))
             ?: throw BadRequestException("Invalid auth code")
         if (entity.used) throw BadRequestException("Auth code already used")
         if (Instant.now().isAfter(entity.expiresAt)) throw BadRequestException("Auth code expired")
@@ -227,11 +231,12 @@ class AuthResource @Inject constructor(
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun issueOAuthCode(userId: String, email: String, appId: String?): String {
-        val code = ByteArray(32).also { secureRandom.nextBytes(it) }
+        val rawCode = ByteArray(32).also { secureRandom.nextBytes(it) }
             .joinToString("") { "%02x".format(it) }
+        // Store HMAC of the code — a DB dump cannot be used to redeem outstanding codes
         oauthCodeRepository.persist(OAuthCodeEntity().apply {
             id = UUID.randomUUID().toString()
-            this.code = code
+            this.code = Hmac.sha256(rawCode, tokenPepper)
             this.userId = userId
             this.email = email
             this.appId = appId
@@ -239,7 +244,7 @@ class AuthResource @Inject constructor(
             used = false
             createdAt = Instant.now()
         })
-        return code
+        return rawCode
     }
 
     private fun checkRateLimit(ctx: ContainerRequestContext) {
@@ -265,14 +270,14 @@ class AuthResource @Inject constructor(
 
     /** Encode provider + appId + redirectUri into a signed OAuth state param.
      *  Format: base64url(provider\nappId\nnonce[\nredirectUri])~hmac
-     *  The HMAC signature prevents tampering with state in-flight (e.g. open redirect via redirectUri swap). */
+     *  Uses auth.state-hmac-secret (separate from admin key and token pepper). */
     private fun buildOAuthState(provider: String, appId: String?, redirectUri: String?): String {
         val nonce = ByteArray(16).also { secureRandom.nextBytes(it) }
             .joinToString("") { "%02x".format(it) }
         val parts = listOfNotNull(provider, appId ?: "", nonce, redirectUri)
         val payload = java.util.Base64.getUrlEncoder().withoutPadding()
             .encodeToString(parts.joinToString("\n").toByteArray())
-        val sig = apiKeyHasher.hash(payload)
+        val sig = Hmac.sha256(payload, stateHmacSecret)
         return "$payload~$sig"
     }
 
@@ -284,8 +289,7 @@ class AuthResource @Inject constructor(
 
         val payload = state.substring(0, tildeIdx)
         val sig = state.substring(tildeIdx + 1)
-        // Constant-time comparison to prevent timing attacks on state forgery
-        if (!apiKeyHasher.verify(payload, sig)) throw BadRequestException("Invalid OAuth state signature")
+        if (!Hmac.verify(payload, sig, stateHmacSecret)) throw BadRequestException("Invalid OAuth state signature")
 
         return try {
             val decoded = String(java.util.Base64.getUrlDecoder().decode(payload))

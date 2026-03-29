@@ -90,7 +90,7 @@ SQLite is used by default — no database setup needed. The EC key pair is gener
 
 All commands below run from the `auth-service/` directory (where `pom.xml` lives).
 
-**Profile:** A packaged run uses Quarkus's **`prod`** profile. On startup, the service refuses to boot unless `AUTH_KEY_HMAC_SECRET` is set to something other than the default dev value. Set `AUTH_ADMIN_KEY` if you need the `/auth/apps` admin API.
+**Profile:** A packaged run uses Quarkus's **`prod`** profile. On startup, the service refuses to boot unless all three HMAC secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`) are set to non-default values. Set `AUTH_ADMIN_KEY` if you need the `/auth/apps` admin API.
 
 **EC key pair:** Generated automatically on first boot and stored in the database. Mount a persistent volume for the DB file so the key survives container restarts.
 
@@ -104,6 +104,8 @@ All commands below run from the `auth-service/` directory (where `pom.xml` lives
 cd auth-service
 ./mvnw package -DskipTests
 export AUTH_KEY_HMAC_SECRET="your-hmac-secret-at-least-32-chars"
+export AUTH_STATE_HMAC_SECRET="your-state-hmac-secret-at-least-32-chars"
+export AUTH_TOKEN_PEPPER="your-token-pepper-at-least-32-chars"
 export AUTH_ADMIN_KEY="your-admin-key"   # optional; omit to disable app management API
 java -jar target/quarkus-app/quarkus-run.jar
 ```
@@ -118,6 +120,8 @@ cd auth-service
 docker build -f src/main/docker/Dockerfile.jvm -t auth-service:latest .
 docker run --rm -p 8703:8703 \
   -e AUTH_KEY_HMAC_SECRET="your-hmac-secret-at-least-32-chars" \
+  -e AUTH_STATE_HMAC_SECRET="your-state-hmac-secret-at-least-32-chars" \
+  -e AUTH_TOKEN_PEPPER="your-token-pepper-at-least-32-chars" \
   -e AUTH_ADMIN_KEY="your-admin-key" \
   -e AUTH_BASE_URL="https://auth.example.com" \
   -v /data/auth:/data \
@@ -140,6 +144,8 @@ On first register/OAuth-login into a `requiresExplicitAccess: true` app, access 
 |----------|----------|-------------|
 | `AUTH_ADMIN_KEY` | For app mgmt | Key for `/auth/apps` endpoints |
 | `AUTH_KEY_HMAC_SECRET` | Prod | HMAC secret for hashing the admin key; min 32 chars |
+| `AUTH_STATE_HMAC_SECRET` | Prod | HMAC secret for signing OAuth state params (prevents open redirect / CSRF) |
+| `AUTH_TOKEN_PEPPER` | Prod | HMAC pepper for storing auth tokens and OAuth codes at rest |
 | `AUTH_BASE_URL` | For OAuth | Base URL for OAuth callback redirect (e.g. `https://auth.example.com`) |
 | `AUTH_JWT_EXPIRY_SECONDS` | No | Token TTL in seconds (default: 604800 = 7 days) |
 | `AUTH_DB_FILE` | No | Path to SQLite DB file (default: `./authservice.db`) |
@@ -176,9 +182,9 @@ ES256 provides stronger security with significantly less CPU cost at signing tim
 | JWT signing | ES256 (ECDSA P-256); private key persisted in DB, never leaves the process |
 | Token audience | `aud` claim set to `appId`; consuming services must validate to prevent cross-app reuse |
 | Token issuer | `iss` claim set to `AUTH_BASE_URL`; consuming services should validate |
-| Auth tokens at rest | Password-reset / magic-link tokens stored as `HMAC(token)` — plaintext never written to DB |
-| OAuth state | HMAC-signed (`payload~sig`) to prevent redirectUri tampering in-flight |
-| Admin key | Stored as HMAC hash, compared constant-time; hash pre-computed at startup |
+| Auth tokens at rest | Password-reset / magic-link tokens and OAuth codes stored as `HMAC(value, AUTH_TOKEN_PEPPER)` — plaintext never written to DB |
+| OAuth state | HMAC-signed with `AUTH_STATE_HMAC_SECRET` (`payload~sig`) to prevent redirectUri tampering / open redirect |
+| Admin key | Stored as `HMAC(key, AUTH_KEY_HMAC_SECRET)`, compared constant-time; hash pre-computed at startup |
 | Rate limiting | Per-IP (configurable RPM) + per-account (10 RPM) on login to block distributed brute force |
 | Redirect URIs | HTTPS enforced; validated at registration and at use time; exact-match only |
 | OAuth account linking | Not automatic — requires authenticated link flow to prevent email-based account takeover |

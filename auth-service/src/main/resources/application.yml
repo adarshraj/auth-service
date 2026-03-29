@@ -34,8 +34,13 @@ auth:
     # Token expiry in seconds. Default 7 days.
     expiry-seconds: ${AUTH_JWT_EXPIRY_SECONDS:604800}
   admin-key: ${AUTH_ADMIN_KEY:}
-  # HMAC-SHA256 server secret for hashing the admin key before comparison.
+  # HMAC-SHA256 secrets — three separate secrets to limit blast radius if one leaks.
+  # auth.key-hmac-secret  → admin key comparison (ApiKeyHasher)
+  # auth.state-hmac-secret → OAuth state signing  (AuthResource)
+  # auth.token-pepper      → auth token / oauth code storage hashing (UserService, AuthResource)
   key-hmac-secret: ${AUTH_KEY_HMAC_SECRET:dev-only-insecure-hmac-secret-change-in-prod}
+  state-hmac-secret: ${AUTH_STATE_HMAC_SECRET:dev-only-insecure-state-secret-change-in-prod}
+  token-pepper: ${AUTH_TOKEN_PEPPER:dev-only-insecure-token-pepper-change-in-prod}
   rate-limit:
     enabled: ${AUTH_RATE_LIMIT_ENABLED:true}
     requests-per-minute: ${AUTH_RATE_LIMIT_RPM:60}
@@ -66,6 +71,8 @@ auth:
       enabled: false
   auth:
     admin-key: test-admin-key
+    state-hmac-secret: "test-state-hmac-secret-32-chars!!"
+    token-pepper: "test-token-pepper-exactly-32chars!!"
     key-hmac-secret: "test-hmac-secret-exactly-32-chars!!"
     rate-limit:
       enabled: false

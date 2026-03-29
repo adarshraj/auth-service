@@ -54,6 +54,7 @@ class JwtService @Inject constructor(
         return try {
             val claims = Jwts.parser()
                 .verifyWith(ecKeyService.publicKey)
+                .requireIssuer(baseUrl)
                 .build()
                 .parseSignedClaims(token)
                 .payload

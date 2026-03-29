@@ -13,20 +13,28 @@ class StartupGuard @Inject constructor(
     @ConfigProperty(name = "quarkus.profile", defaultValue = "dev") private val profile: String,
     @ConfigProperty(name = "auth.admin-key") private val adminKey: Optional<String>,
     @ConfigProperty(name = "auth.key-hmac-secret") private val hmacSecret: String,
+    @ConfigProperty(name = "auth.state-hmac-secret") private val stateHmacSecret: String,
+    @ConfigProperty(name = "auth.token-pepper") private val tokenPepper: String,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(StartupGuard::class.java)
-        private const val DEFAULT_HMAC = "dev-only-insecure-hmac-secret-change-in-prod"
+        private val DEV_DEFAULTS = setOf(
+            "dev-only-insecure-hmac-secret-change-in-prod",
+            "dev-only-insecure-state-secret-change-in-prod",
+            "dev-only-insecure-token-pepper-change-in-prod",
+        )
     }
 
     fun onStart(@Observes ev: StartupEvent) {
-        checkHmacSecret()
+        checkSecret("auth.key-hmac-secret / AUTH_KEY_HMAC_SECRET", hmacSecret)
+        checkSecret("auth.state-hmac-secret / AUTH_STATE_HMAC_SECRET", stateHmacSecret)
+        checkSecret("auth.token-pepper / AUTH_TOKEN_PEPPER", tokenPepper)
         checkAdminKey()
     }
 
-    private fun checkHmacSecret() {
-        if (hmacSecret == DEFAULT_HMAC) {
-            val msg = "auth.key-hmac-secret is using the default dev value. Set AUTH_KEY_HMAC_SECRET in production."
+    private fun checkSecret(name: String, value: String) {
+        if (value in DEV_DEFAULTS) {
+            val msg = "$name is using the default dev value. Set it to a unique secret in production."
             if (isProd()) throw IllegalStateException(msg) else log.warn(msg)
         }
     }
