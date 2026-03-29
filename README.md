@@ -7,8 +7,10 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 - Single shared user pool — one account works across all your apps
 - Per-app access gates — apps can require explicit user grants before login is allowed
 - Password login (bcrypt-compatible with finance-tracker hashes)
-- Google and GitHub OAuth
-- JWT HS256 tokens — same `JWT_SECRET` shared with ai-wrap, so tokens verified anywhere without network calls
+- Google and GitHub OAuth with browser-safe redirect flow
+- JWT **ES256** tokens signed with a persisted EC P-256 key pair
+- Public JWKS endpoint — consuming services verify tokens using the public key, no shared secret needed
+- `aud` claim scoped to `appId` — a token issued for one app is rejected by any other app
 
 ## API
 
@@ -21,8 +23,10 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 | `POST` | `/auth/logout` | Stateless — client drops the token |
 | `GET`  | `/auth/me` | Current user (requires `Authorization: Bearer <token>`) |
 | `DELETE` | `/auth/account` | Delete own account (requires JWT) |
-| `GET`  | `/auth/oauth/{provider}` | Redirect to Google or GitHub (`X-App-Id` optional) |
-| `GET`  | `/auth/oauth/callback` | OAuth callback → JWT |
+| `GET`  | `/auth/oauth/{provider}` | Redirect to Google or GitHub; optional `?redirect_uri=` and `X-App-Id` |
+| `GET`  | `/auth/oauth/callback` | OAuth callback — issues a one-time code, redirects to `redirect_uri?code=` |
+| `POST` | `/auth/token` | Exchange one-time code for a JWT (`application/x-www-form-urlencoded`, field: `code`) |
+| `GET`  | `/.well-known/jwks.json` | Public key in JWK Set format for ES256 token verification |
 
 ### App management (admin — requires `X-Admin-Key`)
 
@@ -35,82 +39,124 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 | `POST` | `/auth/apps/{appId}/access/{userId}` | Grant access |
 | `DELETE` | `/auth/apps/{appId}/access/{userId}` | Revoke access |
 
+## OAuth browser flow
+
+When a client app wants to log a user in via OAuth and receive a JWT:
+
+1. Redirect the user to `GET /auth/oauth/{provider}?redirect_uri=https://yourapp.com/callback` with `X-App-Id: your-app`.
+2. After the provider callback, auth-service redirects to `https://yourapp.com/callback?code=<one-time-code>`.
+3. Your server (back-channel) POSTs the code:
+   ```
+   POST /auth/token
+   Content-Type: application/x-www-form-urlencoded
+
+   code=<one-time-code>
+   ```
+4. Response is `{ token, user }`. The code is valid for **60 seconds** and single-use.
+
+The JWT is never placed in a URL or fragment — it only travels over the back-channel exchange.
+
+**`redirect_uri` must be registered** for the app via `POST /auth/apps` (`redirectUris` field) before the flow will work.
+
+## Verifying tokens in consuming services
+
+Fetch the public key once (or on a schedule) and cache it:
+
+```
+GET /.well-known/jwks.json
+```
+
+Verify the token signature using the EC P-256 public key (`alg: ES256`). Also validate:
+- `aud` matches your app ID (prevents accepting tokens issued for other apps)
+- `exp` is in the future
+
+No shared secret is needed. If the key pair is rotated, the `kid` field changes — re-fetch JWKS when you encounter an unknown `kid`.
+
 ## Running locally
 
 ```bash
 cd auth-service
-export JWT_SECRET="your-shared-secret-min-32-chars"
 export AUTH_ADMIN_KEY="your-admin-key"
 ./mvnw quarkus:dev
 # Starts on http://localhost:8703
 ```
 
-SQLite is used by default — no database setup needed.
+SQLite is used by default — no database setup needed. The EC key pair is generated on first boot and persisted to the DB.
 
 ## Production
 
 All commands below run from the `auth-service/` directory (where `pom.xml` lives).
 
-**Profile:** A packaged run uses Quarkus’s **`prod`** profile (not `quarkus:dev`). On startup, the service refuses to boot in prod unless `JWT_SECRET` is set and at least 32 characters, and unless `AUTH_KEY_HMAC_SECRET` is set to something other than the default dev value. Set `AUTH_ADMIN_KEY` if you need the `/auth/apps` admin API.
+**Profile:** A packaged run uses Quarkus's **`prod`** profile. On startup, the service refuses to boot unless `AUTH_KEY_HMAC_SECRET` is set to something other than the default dev value. Set `AUTH_ADMIN_KEY` if you need the `/auth/apps` admin API.
 
-**Database:** SQLite is fine for small deployments — persist the file (for example set `AUTH_DB_FILE` to a path on a mounted volume). For PostgreSQL, set `QUARKUS_DATASOURCE_DB_KIND=postgresql`, the JDBC URL, username, password, and `QUARKUS_HIBERNATE_ORM_DIALECT=org.hibernate.dialect.PostgreSQLDialect` (see comments in `src/main/resources/application.yml`).
+**EC key pair:** Generated automatically on first boot and stored in the database. Mount a persistent volume for the DB file so the key survives container restarts.
 
-**OAuth:** Set `AUTH_BASE_URL` to your public origin (for example `https://auth.example.com`) and configure the Google/GitHub client env vars so callback URLs match your deployment.
+**Database:** SQLite is fine for small deployments — persist the file (set `AUTH_DB_FILE` to a path on a mounted volume). For PostgreSQL, set `QUARKUS_DATASOURCE_DB_KIND=postgresql`, the JDBC URL, username, password, and `QUARKUS_HIBERNATE_ORM_DIALECT=org.hibernate.dialect.PostgreSQLDialect` (see comments in `src/main/resources/application.yml`).
+
+**OAuth:** Set `AUTH_BASE_URL` to your public origin (e.g. `https://auth.example.com`) and configure the Google/GitHub client env vars so callback URLs match your deployment.
 
 ### Run the JVM package (bare metal or VM)
 
 ```bash
 cd auth-service
 ./mvnw package -DskipTests
-export JWT_SECRET="your-shared-secret-at-least-32-chars"
 export AUTH_KEY_HMAC_SECRET="your-hmac-secret-at-least-32-chars"
 export AUTH_ADMIN_KEY="your-admin-key"   # optional; omit to disable app management API
-# Optional: listen on all interfaces (Dockerfile JVM image sets this for containers)
-# export QUARKUS_HTTP_HOST=0.0.0.0
 java -jar target/quarkus-app/quarkus-run.jar
 ```
 
-The HTTP server listens on port **8703** (see `application.yml`). Terminate TLS at a reverse proxy or load balancer in front of the app.
+The HTTP server listens on port **8703**. Terminate TLS at a reverse proxy or load balancer in front of the app.
 
 ### Docker (JVM image)
-
-Build the runnable layout, then build and run the stock Quarkus JVM image:
 
 ```bash
 cd auth-service
 ./mvnw package -DskipTests
 docker build -f src/main/docker/Dockerfile.jvm -t auth-service:latest .
 docker run --rm -p 8703:8703 \
-  -e JWT_SECRET="your-shared-secret-at-least-32-chars" \
   -e AUTH_KEY_HMAC_SECRET="your-hmac-secret-at-least-32-chars" \
   -e AUTH_ADMIN_KEY="your-admin-key" \
   -e AUTH_BASE_URL="https://auth.example.com" \
+  -v /data/auth:/data \
+  -e AUTH_DB_FILE=/data/authservice.db \
   auth-service:latest
 ```
 
-The generated `Dockerfile.jvm` comments still refer to port 8080 from the Quarkus template; **this service uses 8703**, so map `8703:8703`. For a persistent SQLite file inside the container, mount a volume and set `AUTH_DB_FILE` (or point `QUARKUS_DATASOURCE_JDBC_URL` at your SQLite path).
+Mount a volume (`/data/auth`) so the SQLite DB (and the persisted EC key pair) survive container restarts.
 
 ## Per-app access control
 
 Apps registered with `requiresExplicitAccess: false` (default) let any registered user log in.
 Apps registered with `requiresExplicitAccess: true` block login unless the user has been granted access via `POST /auth/apps/{appId}/access/{userId}`.
 
-On first register/OAuth-login into an `requiresExplicitAccess: true` app, access is auto-granted for convenience. Use the admin API to revoke it.
+On first register/OAuth-login into a `requiresExplicitAccess: true` app, access is auto-granted for convenience. Use the admin API to revoke it.
 
 ## Environment variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `JWT_SECRET` | Yes | HS256 signing key (share with ai-wrap and any service that verifies tokens) |
-| `AUTH_ADMIN_KEY` | Yes (for app mgmt) | Key for `/auth/apps` endpoints |
+| `AUTH_ADMIN_KEY` | For app mgmt | Key for `/auth/apps` endpoints |
 | `AUTH_KEY_HMAC_SECRET` | Prod | HMAC secret for hashing the admin key; min 32 chars |
 | `AUTH_BASE_URL` | For OAuth | Base URL for OAuth callback redirect (e.g. `https://auth.example.com`) |
+| `AUTH_JWT_EXPIRY_SECONDS` | No | Token TTL in seconds (default: 604800 = 7 days) |
+| `AUTH_DB_FILE` | No | Path to SQLite DB file (default: `./authservice.db`) |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | For Google OAuth | |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | For GitHub OAuth | |
-| `QUARKUS_DATASOURCE_JDBC_URL` | Prod | PostgreSQL JDBC URL |
-| `QUARKUS_DATASOURCE_USERNAME` | Prod | DB username |
-| `QUARKUS_DATASOURCE_PASSWORD` | Prod | DB password |
+| `QUARKUS_DATASOURCE_JDBC_URL` | Prod/PostgreSQL | PostgreSQL JDBC URL |
+| `QUARKUS_DATASOURCE_USERNAME` | Prod/PostgreSQL | DB username |
+| `QUARKUS_DATASOURCE_PASSWORD` | Prod/PostgreSQL | DB password |
+
+> `JWT_SECRET` is no longer used. Tokens are signed with an EC P-256 key pair stored in the database.
 
 ## Migrating finance-tracker users
 
 finance-tracker uses bcrypt with cost factor 10 — same as this service. Export the `users` table and import directly; no re-hashing needed.
+
+## Migrating consuming services from HS256
+
+Services that previously verified JWTs using `JWT_SECRET` need to be updated:
+
+1. Remove `JWT_SECRET` usage.
+2. Fetch the public key from `GET /.well-known/jwks.json`.
+3. Verify tokens using ES256 with the EC P-256 public key.
+4. Validate the `aud` claim matches your app ID.

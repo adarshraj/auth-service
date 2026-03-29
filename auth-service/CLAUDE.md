@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Standalone authentication service for the personal app ecosystem. Kotlin + Quarkus, port **8703**. Single shared user pool with optional per-app access gates. Issues HS256 JWTs that ai-wrap and any other service can verify without calling back to auth-service.
+Standalone authentication service for the personal app ecosystem. Kotlin + Quarkus, port **8703**. Single shared user pool with optional per-app access gates. Issues **ES256** JWTs signed with a persisted EC P-256 key pair. Consuming services verify tokens using the public key from `GET /.well-known/jwks.json` — no shared secret required.
 
 ## Commands
 
@@ -29,9 +29,9 @@ All commands run from `auth-service/` (the inner directory with `pom.xml`):
 
 **Required for dev:**
 ```bash
-export JWT_SECRET="your-shared-secret-min-32-chars"
 export AUTH_ADMIN_KEY="your-admin-key"
 # HMAC secret defaults to a dev value — fine for local, not for prod
+# JWT_SECRET is no longer used — key pair is generated and persisted to DB on first boot
 ```
 
 SQLite is used by default — no database setup needed for development.
@@ -40,9 +40,9 @@ SQLite is used by default — no database setup needed for development.
 
 Layered under `src/main/kotlin/com/authservice/`:
 
-- **`api/`** — JAX-RS resources (`AuthResource`, `AppResource`), DTOs, and exception mappers. Resources delegate all logic to services.
-- **`service/`** — Business logic: `UserService` (registration, login, OAuth account linking, access management, auth tokens), `JwtService` (sign/verify HS256), `PasswordService` (bcrypt), `OAuthService` (Google + GitHub flows), `TokenCleanupJob` (scheduled purge).
-- **`domain/`** — JPA entities and Panache repositories: `UserEntity`, `AppEntity`, `UserAppAccessEntity` (composite PK), `AuthTokenEntity`.
+- **`api/`** — JAX-RS resources (`AuthResource`, `AppResource`, `WellKnownResource`), DTOs, and exception mappers. Resources delegate all logic to services.
+- **`service/`** — Business logic: `UserService` (registration, login, OAuth account linking, access management, auth tokens), `JwtService` (sign/verify ES256), `EcKeyService` (generate/persist/expose EC P-256 key pair), `PasswordService` (bcrypt), `OAuthService` (Google + GitHub flows), `TokenCleanupJob` (scheduled purge).
+- **`domain/`** — JPA entities and Panache repositories: `UserEntity`, `AppEntity`, `UserAppAccessEntity` (composite PK), `AuthTokenEntity`, `EcKeyEntity`, `OAuthCodeEntity`.
 - **`security/`** — `JwtFilter` (protects `/auth/me` and `/auth/account`), `RateLimiter` (in-memory fixed-window), `ApiKeyHasher` (HMAC-SHA256 for admin key), `CallerContext` (request-scoped user identity), `StartupGuard` (validates required secrets on boot).
 - **`config/`** — `RateLimitConfig` and `OAuthConfig` ConfigMapping interfaces.
 
@@ -50,11 +50,17 @@ Layered under `src/main/kotlin/com/authservice/`:
 
 **Login:** `AuthResource.login()` → `UserService.login()` (verify bcrypt, check app gate) → `JwtService.sign()` → `AuthResponse{token, user}`
 
-**OAuth:** `GET /auth/oauth/{provider}` → 302 to provider → provider redirects to `GET /auth/oauth/callback` → `OAuthService.exchangeCode()` → `UserService.findOrCreateByOAuth()` → `AuthResponse`
+**OAuth (browser flow with redirect_uri):**
+1. `GET /auth/oauth/{provider}?redirect_uri=https://app.com/cb` (with `X-App-Id`)
+2. 302 to provider → provider redirects to `GET /auth/oauth/callback`
+3. `OAuthService.exchangeCode()` → `UserService.findOrCreateByOAuth()` → issue one-time code → 302 to `redirect_uri?code=<code>`
+4. Client POSTs `POST /auth/token` (form: `code=<code>`) → JWT returned (code valid 60s, single-use)
+
+**OAuth (API flow without redirect_uri):** Same as above but callback returns `AuthResponse` JSON directly.
 
 **Per-app gate:** If `apps.requires_explicit_access = true`, login is blocked unless a `user_app_access` row exists. Auto-granted on first register/OAuth into that app.
 
-**JWT verification in other services:** Any service with the same `JWT_SECRET` can call `JwtService.verify(token)` locally — no HTTP call needed. Token payload: `{sub, userId, email, appId, iat, exp}`.
+**JWT verification in other services:** Fetch public key from `GET /.well-known/jwks.json`, verify ES256 signature, validate `aud` claim matches app ID. Token payload: `{sub, userId, email, appId, aud, iat, exp}`.
 
 ### Database schema (Flyway migrations)
 
@@ -64,6 +70,9 @@ Layered under `src/main/kotlin/com/authservice/`:
 | V2 | `apps` | Registered apps — id (e.g. `finance-tracker`), name, requires_explicit_access |
 | V3 | `user_app_access` | Per-user app grants — composite PK (user_id, app_id), role, granted_at |
 | V4 | `auth_tokens` | One-time tokens — type (`password_reset`, `magic_link`, `email_verification`), expires_at, used |
+| V5 | `apps.redirect_uris` | Newline-separated allowed redirect URIs per app |
+| V6 | `ec_keys` | Persisted EC P-256 key pair (single row, id=`primary`) |
+| V7 | `oauth_codes` | Short-lived one-time codes for the OAuth browser redirect flow (60s TTL) |
 
 ### Admin key security
 
@@ -71,11 +80,14 @@ The `X-Admin-Key` header value is never stored raw. Comparison works by hashing 
 
 **Admin API is disabled** (returns 501) if `AUTH_ADMIN_KEY` is not set. Apps still work — only the `/auth/apps` management endpoints are gated.
 
+### EC key pair lifecycle
+
+`EcKeyService` observes `StartupEvent` and either loads the existing key pair from the `ec_keys` table or generates a new one (on first boot). The private key never leaves the process. `kid` is a random UUID stored alongside the key and included in each JWT header and JWKS response. If the DB is wiped, a new key pair is generated — all existing tokens will become invalid.
+
 ## Configuration
 
 | Config path | Env var | Purpose |
 |---|---|---|
-| `auth.jwt.secret` | `JWT_SECRET` | HS256 signing key — must match all services that verify tokens |
 | `auth.jwt.expiry-seconds` | `AUTH_JWT_EXPIRY_SECONDS` | Token TTL (default 604800 = 7 days) |
 | `auth.admin-key` | `AUTH_ADMIN_KEY` | Key for `/auth/apps` endpoints (optional — disables app mgmt if unset) |
 | `auth.key-hmac-secret` | `AUTH_KEY_HMAC_SECRET` | HMAC-SHA256 secret for admin key hashing (min 32 chars, required in prod) |
@@ -90,7 +102,7 @@ The `X-Admin-Key` header value is never stored raw. Comparison works by hashing 
 | `quarkus.datasource.username` | `QUARKUS_DATASOURCE_USERNAME` | DB username (prod only) |
 | `quarkus.datasource.password` | `QUARKUS_DATASOURCE_PASSWORD` | DB password (prod only) |
 
-**Dev profile:** SQLite at `./authservice-dev.db`. **Test profile:** In-memory SQLite, rate limiting disabled, hardcoded secrets. **Prod profile:** SQLite by default (works fine for personal use — just mount a persistent volume for the `.db` file). `StartupGuard` throws on boot if JWT_SECRET is blank, < 32 chars, or HMAC secret is the default dev value. PostgreSQL is supported but optional — set `QUARKUS_DATASOURCE_DB_KIND=postgresql` and related env vars at runtime if needed.
+**Dev profile:** SQLite at `./authservice-dev.db`. **Test profile:** In-memory SQLite, rate limiting disabled. **Prod profile:** SQLite by default — mount a persistent volume for the `.db` file. `StartupGuard` throws on boot if HMAC secret is the default dev value. PostgreSQL is supported but optional.
 
 ## Code patterns
 
@@ -114,10 +126,12 @@ The `X-Admin-Key` header value is never stored raw. Comparison works by hashing 
 
 `PasswordService` uses `at.favre.lib:bcrypt` at cost factor 10, producing `$2a$10$...` hashes. This is byte-for-byte compatible with Node's `bcrypt` npm package at cost 10 — finance-tracker's existing user `password_hash` values can be imported directly into the `users` table without re-hashing.
 
-## JWT compatibility
+## JWT format
 
-`JwtService.sign()` sets both `sub = userId` and `userId = userId` in the payload. This is intentional:
-- `sub` is the standard claim that ai-wrap (and any other JWT-aware service) uses to identify the caller.
-- `userId` is the custom claim finance-tracker reads for backward compatibility.
+`JwtService.sign()` sets both `sub = userId` and `userId = userId` in the payload:
+- `sub` — standard claim used by any JWT-aware service to identify the caller.
+- `userId` — custom claim for backward compatibility with finance-tracker.
+- `aud` — set to `appId` when present; consuming services should validate this to prevent cross-app token reuse.
+- `kid` — key ID in the header; matches the `kid` in the JWKS response.
 
-Any service holding the same `JWT_SECRET` can verify these tokens without calling auth-service.
+Tokens are signed with ES256 (ECDSA P-256). Verify using the public key from `GET /.well-known/jwks.json`.
