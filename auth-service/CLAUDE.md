@@ -27,12 +27,11 @@ All commands run from `auth-service/` (the inner directory with `pom.xml`):
 ./mvnw test -Dtest=AuthResourceTest#login
 ```
 
-**Required for dev:**
+**Required for dev:** Nothing — all secrets have insecure dev defaults that are accepted in the `dev` profile (warnings logged, startup not blocked). Optionally set `AUTH_ADMIN_KEY` to enable the app management endpoints:
 ```bash
 export AUTH_ADMIN_KEY="your-admin-key"
-# HMAC secret defaults to a dev value — fine for local, not for prod
-# JWT_SECRET is no longer used — key pair is generated and persisted to DB on first boot
 ```
+All three HMAC secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`) **must** be set to non-default values in prod — `StartupGuard` throws on boot otherwise.
 
 SQLite is used by default — no database setup needed for development.
 

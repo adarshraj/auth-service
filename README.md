@@ -79,10 +79,11 @@ No shared secret is needed. If the key pair is rotated, the `kid` field changes 
 
 ```bash
 cd auth-service
-export AUTH_ADMIN_KEY="your-admin-key"
 ./mvnw quarkus:dev
 # Starts on http://localhost:8703
 ```
+
+No env vars are required for local dev — all secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`) have insecure dev defaults that are accepted in the `dev` profile (a warning is logged but startup is not blocked). Set `AUTH_ADMIN_KEY` only if you need the app management endpoints.
 
 SQLite is used by default — no database setup needed. The EC key pair is generated on first boot and persisted to the DB.
 
