@@ -23,8 +23,10 @@ import java.time.Duration
 @ApplicationScoped
 class OAuthService @Inject constructor(
     private val oauthConfig: OAuthConfig,
-    @ConfigProperty(name = "auth.base-url", defaultValue = "http://localhost:8703") private val baseUrl: String,
+    @ConfigProperty(name = "auth.base-url", defaultValue = "http://localhost:8703") baseUrl: String,
 ) {
+    // Normalize once — trailing slash on AUTH_BASE_URL must not produce double slashes in callback URLs
+    private val baseUrl = baseUrl.trimEnd('/')
     companion object {
         private val log: Logger = Logger.getLogger(OAuthService::class.java)
         private val CONNECT_TIMEOUT = Duration.ofSeconds(10)

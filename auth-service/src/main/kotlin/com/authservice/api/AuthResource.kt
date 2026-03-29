@@ -221,11 +221,11 @@ class AuthResource @Inject constructor(
             ?: throw BadRequestException("Invalid auth code")
         if (entity.used) throw BadRequestException("Auth code already used")
         if (Instant.now().isAfter(entity.expiresAt)) throw BadRequestException("Auth code expired")
-        entity.used = true
-
-        // Guard: account may have been deleted between code issuance and exchange
+        // Load user before marking code used — transient errors won't burn the code unnecessarily
         val user = try { userService.getById(entity.userId) }
             catch (e: jakarta.ws.rs.NotFoundException) { throw BadRequestException("Invalid auth code") }
+        entity.used = true
+
         val token = jwtService.sign(entity.userId, entity.email, entity.appId)
         return AuthResponse(token, user.toResponse())
     }
