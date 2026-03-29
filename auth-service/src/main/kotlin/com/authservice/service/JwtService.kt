@@ -20,8 +20,11 @@ import java.util.Date
 class JwtService @Inject constructor(
     private val ecKeyService: EcKeyService,
     @ConfigProperty(name = "auth.jwt.expiry-seconds", defaultValue = "604800") private val expirySeconds: Long,
-    @ConfigProperty(name = "auth.base-url", defaultValue = "http://localhost:8703") private val baseUrl: String,
+    @ConfigProperty(name = "auth.base-url", defaultValue = "http://localhost:8703") baseUrl: String,
 ) {
+    // Normalize once — trailing slash on AUTH_BASE_URL must not cause iss mismatch
+    private val issuer = baseUrl.trimEnd('/')
+
     companion object {
         private val log: Logger = Logger.getLogger(JwtService::class.java)
     }
@@ -37,7 +40,7 @@ class JwtService @Inject constructor(
         val exp = now + expirySeconds * 1000L
         val builder = Jwts.builder()
             .header().keyId(ecKeyService.kid).and()
-            .issuer(baseUrl)
+            .issuer(issuer)
             .subject(userId)
             .claim("userId", userId)
             .claim("email", email)
@@ -54,7 +57,7 @@ class JwtService @Inject constructor(
         return try {
             val claims = Jwts.parser()
                 .verifyWith(ecKeyService.publicKey)
-                .requireIssuer(baseUrl)
+                .requireIssuer(issuer)
                 .build()
                 .parseSignedClaims(token)
                 .payload

@@ -85,7 +85,8 @@ class UserService @Inject constructor(
             ?: throw NotAuthorizedException("Invalid email or password", "Bearer")
 
         if (user.passwordHash == null) {
-            throw NotAuthorizedException("This account uses social login — use the OAuth provider to sign in", "Bearer")
+            // Generic message — do not reveal that this email is registered via OAuth only (account enumeration)
+            throw NotAuthorizedException("Invalid email or password", "Bearer")
         }
 
         if (!passwordService.verify(password, user.passwordHash!!)) {

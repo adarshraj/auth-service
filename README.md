@@ -182,7 +182,7 @@ ES256 provides stronger security with significantly less CPU cost at signing tim
 |---|---|
 | JWT signing | ES256 (ECDSA P-256); private key persisted in DB, never leaves the process |
 | Token audience | `aud` claim set to `appId`; consuming services must validate to prevent cross-app reuse |
-| Token issuer | `iss` claim set to `AUTH_BASE_URL`; consuming services should validate |
+| Token issuer | `iss` set to `AUTH_BASE_URL` (trailing slash stripped); consuming services must validate |
 | Auth tokens at rest | Password-reset / magic-link tokens and OAuth codes stored as `HMAC(value, AUTH_TOKEN_PEPPER)` — plaintext never written to DB |
 | OAuth state | HMAC-signed with `AUTH_STATE_HMAC_SECRET` (`payload~sig`) to prevent redirectUri tampering / open redirect |
 | Admin key | Stored as `HMAC(key, AUTH_KEY_HMAC_SECRET)`, compared constant-time; hash pre-computed at startup |
@@ -190,6 +190,19 @@ ES256 provides stronger security with significantly less CPU cost at signing tim
 | Redirect URIs | HTTPS enforced; validated at registration and at use time; exact-match only |
 | OAuth account linking | Not automatic — requires authenticated link flow to prevent email-based account takeover |
 | OpenAPI/Swagger | Disabled in `prod` profile |
+| Login error messages | Generic "Invalid email or password" for all failures — does not reveal whether email is registered or OAuth-only |
+| Deleted-user guard | `POST /auth/token` rejects a valid code if the account was deleted after code issuance |
+
+### By-design / operational notes
+
+- **`/auth/me` and `/auth/account` are app-agnostic** — they return the global user identity and do not enforce `aud`. This is intentional: these routes serve any valid JWT regardless of which app issued it. If you need per-app identity binding on these routes, pass `X-App-Id` and validate `aud` in your own middleware.
+- **Redirect URI exact-match** — `https://app/cb` and `https://app/cb/` are treated as different URIs. Register URIs exactly as your app will use them.
+- **JWT lifetime (7 days)** and **bcrypt cost 10** are policy choices tuned for a personal low-resource server. Tighten `AUTH_JWT_EXPIRY_SECONDS` or bcrypt cost if your threat model requires it.
+- **No PKCE** — acceptable for confidential clients (server-to-server). Add PKCE before supporting mobile or SPA public clients.
+- **OAuth state size** — grows with long `redirect_uri` values. All major providers tolerate the current size; no action needed unless you hit provider limits.
+- **SQLite key material** — the EC private key and user data live in the DB file. Protect it with filesystem permissions, encrypted volumes, and off-site backups.
+- **TLS, HSTS, CORS** — terminate TLS at the reverse proxy; set `AUTH_CORS_ORIGINS` explicitly in prod (default is empty — not `*`); add HSTS at the proxy.
+- **Dependency CVEs** — no automated scanner is configured in-repo. Consider adding Dependabot or OSV-Scanner to the CI pipeline.
 
 ## Migrating consuming services from HS256
 
