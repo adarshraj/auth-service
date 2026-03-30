@@ -31,7 +31,7 @@ All commands run from `auth-service/` (the inner directory with `pom.xml`):
 ```bash
 export AUTH_ADMIN_KEY="your-admin-key"
 ```
-All three HMAC secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`) **must** be set to non-default values in prod — `StartupGuard` throws on boot otherwise.
+All four HMAC secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`, `AUTH_MFA_HMAC_SECRET`) **must** be set to non-default values in prod — `StartupGuard` throws on boot otherwise.
 
 SQLite is used by default — no database setup needed for development.
 
@@ -40,24 +40,43 @@ SQLite is used by default — no database setup needed for development.
 Layered under `src/main/kotlin/com/authservice/`:
 
 - **`api/`** — JAX-RS resources (`AuthResource`, `AppResource`, `VerifyResource`, `WellKnownResource`), DTOs, and exception mappers. Resources delegate all logic to services.
-- **`service/`** — Business logic: `UserService` (registration, login, OAuth account linking, access management, auth tokens), `JwtService` (sign/verify ES256), `EcKeyService` (generate/persist/expose EC P-256 key pair), `PasswordService` (bcrypt), `OAuthService` (Google + GitHub flows), `TokenCleanupJob` (scheduled purge).
+- **`service/`** — Business logic: `UserService` (registration, login, OAuth account linking, access management, auth tokens, MFA), `JwtService` (sign/verify ES256), `EcKeyService` (generate/persist/expose EC P-256 key pair), `PasswordService` (bcrypt), `OAuthService` (Google + GitHub flows), `TotpService` (TOTP generation/verification using JDK crypto), `TokenCleanupJob` (scheduled purge).
 - **`domain/`** — JPA entities and Panache repositories: `UserEntity`, `AppEntity`, `UserAppAccessEntity` (composite PK), `AuthTokenEntity`, `RefreshTokenEntity`, `EcKeyEntity`, `OAuthCodeEntity`.
-- **`security/`** — `JwtFilter` (protects `/auth/me` and `/auth/account`), `SessionCookieFilter` (sets/clears `platform_session` HttpOnly cookie on auth responses), `RateLimiter` (in-memory fixed-window), `OAuthNonceStore` (single-use nonce validation for OAuth CSRF protection), `ApiKeyHasher` (HMAC-SHA256 for admin key), `CallerContext` (request-scoped user identity), `StartupGuard` (validates required secrets on boot), `SecurityHeadersFilter` (adds X-Content-Type-Options, X-Frame-Options, CSP, HSTS, Referrer-Policy to all responses).
+- **`security/`** — `JwtFilter` (protects `/auth/me`, `/auth/account`, and `/auth/mfa/setup|confirm|disable`), `SessionCookieFilter` (sets/clears `platform_session` HttpOnly cookie on auth responses), `RateLimiter` (in-memory fixed-window), `OAuthNonceStore` (single-use nonce validation for OAuth CSRF protection), `MfaNonceStore` (single-use nonce for MFA tokens), `ApiKeyHasher` (HMAC-SHA256 for admin key), `CallerContext` (request-scoped user identity), `StartupGuard` (validates required secrets on boot), `SecurityHeadersFilter` (adds X-Content-Type-Options, X-Frame-Options, CSP, HSTS, Referrer-Policy to all responses).
 - **`config/`** — `RateLimitConfig` and `OAuthConfig` ConfigMapping interfaces.
 
 ### Key flows
 
-**Login:** `AuthResource.login()` → `UserService.login()` (verify bcrypt, check app gate) → `JwtService.sign()` + `UserService.issueRefreshToken()` → `AuthResponse{token, refreshToken, user}`
+**Login (without MFA):** `AuthResource.login()` → `UserService.login()` (verify bcrypt, check app gate) → `JwtService.sign()` + `UserService.issueRefreshToken()` → `AuthResponse{token, refreshToken, user}`
+
+**Login (with MFA):** `AuthResource.login()` → `UserService.login()` → MFA enabled? → `MfaChallengeResponse{mfaRequired, mfaToken}` → client calls `POST /auth/mfa/verify` with TOTP code or backup code → `AuthResponse{token, refreshToken, user}`
 
 **Token refresh:** `POST /auth/refresh` (form: `refresh_token=<token>`) → `UserService.rotateRefreshToken()` (atomically revokes old token, issues new one) → new `AuthResponse{token, refreshToken, user}`. Refresh tokens are single-use (rotation) with a 7-day TTL. Access tokens are short-lived (15 minutes by default).
+
+**MFA enrollment:** `POST /auth/mfa/setup` (JWT required) → returns secret + QR URI + recovery codes → user scans QR → `POST /auth/mfa/confirm` with valid TOTP → MFA enabled
 
 **OAuth (browser flow with redirect_uri):**
 1. `GET /auth/oauth/{provider}?redirect_uri=https://app.com/cb` (with `X-App-Id`)
 2. 302 to provider → provider redirects to `GET /auth/oauth/callback`
 3. `OAuthService.exchangeCode()` → `UserService.findOrCreateByOAuth()` → issue one-time code → 302 to `redirect_uri?code=<code>`
 4. Client POSTs `POST /auth/token` (form: `code=<code>`) → JWT returned (code valid 60s, single-use)
+5. If MFA enabled: step 3 redirects to `redirect_uri?mfa_required=true&mfa_code=<code>` instead → client exchanges code via `POST /auth/mfa/challenge` (form: `code=<code>`) → receives `MfaChallengeResponse` → completes via `POST /auth/mfa/verify`
 
-**OAuth (API flow without redirect_uri):** Same as above but callback returns `AuthResponse` JSON directly.
+**OAuth (API flow without redirect_uri):** Same as above but callback returns `AuthResponse` or `MfaChallengeResponse` JSON directly.
+
+### Polymorphic response types
+
+Several endpoints return different response shapes depending on MFA state. Clients must check for the `mfaRequired` field to distinguish:
+
+| Endpoint | Without MFA | With MFA |
+|---|---|---|
+| `POST /auth/login` | `AuthResponse { token, user }` | `MfaChallengeResponse { mfaRequired, mfaToken }` |
+| `POST /auth/token` | `AuthResponse { token, user }` | `MfaChallengeResponse { mfaRequired, mfaToken }` |
+| `GET /auth/oauth/callback` (no redirect) | `AuthResponse { token, user }` | `MfaChallengeResponse { mfaRequired, mfaToken }` |
+
+All three return HTTP 200 in both cases. The presence of `mfaRequired: true` indicates the client must complete the MFA flow via `POST /auth/mfa/verify` before receiving a JWT.
+
+> **Client implementation pattern:** Check if the response contains `mfaRequired`. If yes, prompt for TOTP and call `/auth/mfa/verify`. If no, the `token` field is the JWT. This branching logic is the only change required in existing clients to support MFA.
 
 **Per-app gate:** If `apps.requires_explicit_access = true`, login is blocked unless a `user_app_access` row exists. Auto-granted on first register/OAuth into that app.
 
@@ -70,11 +89,13 @@ Layered under `src/main/kotlin/com/authservice/`:
 | V1 | `users` | Core user record — id, email, name, password_hash, avatar_url, oauth_provider, oauth_id, email_verified |
 | V2 | `apps` | Registered apps — id (e.g. `finance-tracker`), name, requires_explicit_access |
 | V3 | `user_app_access` | Per-user app grants — composite PK (user_id, app_id), role, granted_at |
-| V4 | `auth_tokens` | One-time tokens — type (`password_reset`, `magic_link`, `email_verification`), expires_at, used (reserved for future endpoints) |
+| V4 | `auth_tokens` | One-time tokens — type (`password_reset`, `magic_link`, `email_verification`, `mfa_challenge`), expires_at, used, app_id |
 | V5 | `apps.redirect_uris` | Newline-separated allowed redirect URIs per app |
 | V6 | `ec_keys` | Persisted EC P-256 key pair (single row, id=`primary`) |
 | V7 | `oauth_codes` | Short-lived one-time codes for the OAuth browser redirect flow (60s TTL) |
 | V8 | `refresh_tokens` | Revocable refresh tokens for access token rotation (7-day TTL, HMAC-hashed at rest) |
+| V9 | `users` (columns) | MFA fields — `mfa_enabled`, `mfa_secret`, `mfa_backup_codes` |
+| V10 | `auth_tokens` (column) | `app_id` — binds token to originating app for MFA challenge flow |
 
 ### Admin key security
 
@@ -131,12 +152,41 @@ Admin endpoints are rate-limited at 20 RPM per IP independently of the auth rate
 
 **Known limitation:** The rate limiter is in-memory (`RateLimiter` uses `ConcurrentHashMap`). In a horizontally-scaled deployment with multiple instances, each instance tracks limits independently — the effective limit per IP is `RPM × instance count`. For single-instance deployments (the intended use case for a personal auth service) this is not a concern. If you scale horizontally, replace with a shared Redis-backed implementation.
 
+### MFA (TOTP)
+
+Optional two-factor authentication using TOTP (RFC 6238). Implemented entirely with JDK crypto (`javax.crypto.Mac` / HMAC-SHA1) — no external libraries.
+
+**Enrollment flow:**
+1. Authenticated user calls `POST /auth/mfa/setup` → receives `secret` (base32), `otpauthUri` (for QR scanning), and 8 single-use `recoveryCodes`.
+2. User scans the QR code with any authenticator app (Google Authenticator, Authy, etc.).
+3. User calls `POST /auth/mfa/confirm` with a valid 6-digit TOTP code → MFA is enabled.
+
+**Login flow with MFA:**
+1. `POST /auth/login` returns `{ "mfaRequired": true, "mfaToken": "..." }` instead of a JWT.
+2. Client calls `POST /auth/mfa/verify` with the `mfaToken` and a TOTP code (or backup code).
+3. Response is the standard `AuthResponse { token, user }`.
+
+**OAuth + MFA:** MFA is enforced across all login paths — password, OAuth JSON callback, and OAuth code exchange (`POST /auth/token`). When a user with MFA enabled completes OAuth, the response is an `MfaChallengeResponse` instead of a JWT. For the redirect flow, the client receives `?mfa_required=true&mfa_token=...` instead of `?code=...`.
+
+**MFA challenge token:** HMAC-signed (`base64url(userId\nemail\nappId\nnonce\nexpiry)~hmac`), signed with `auth.mfa-hmac-secret` (dedicated secret, separate from OAuth state and token pepper), 5-minute TTL. Single-use — nonce is registered in `MfaNonceStore` and consumed on verification. Not a JWT — lightweight and single-purpose.
+
+**Rate limiting on MFA verify:** Per-IP (global RPM) + per-userId (5 RPM) rate limits on `POST /auth/mfa/verify`. The per-userId limit prevents distributed brute force on 6-digit TOTP codes from multiple IPs.
+
+**Backup codes:** 8 codes generated during setup (8 lowercase alphanumeric chars each). Stored as HMAC-SHA256 hashes in `users.mfa_backup_codes` (same pattern as auth tokens — a DB dump does not expose usable codes). Each code is consumed on use (hash removed from the list). Can be used in place of a TOTP code at `POST /auth/mfa/verify` or `POST /auth/mfa/disable`.
+
+**Disabling MFA:** `POST /auth/mfa/disable` requires a valid TOTP or backup code. Clears `mfa_enabled`, `mfa_secret`, and `mfa_backup_codes`.
+
+**Backward compatibility:** MFA is fully optional. Users who have not enabled MFA see no change in login behavior — the response is the same `AuthResponse { token, user }`. Clients only need to handle the MFA challenge flow if their users choose to enable MFA.
+
+**MFA secret storage:** The TOTP secret is encrypted with AES-256-GCM using `SHA-256(AUTH_TOKEN_PEPPER)` as the key. Stored as `iv:ciphertext` in base64. A DB dump does not expose the raw TOTP secret. Backup codes are stored as HMAC hashes (not reversible).
+
 ### Redirect URI policy
 
 Redirect URIs are validated at both registration time (`POST /auth/apps`) and use time (`GET /auth/oauth/{provider}?redirect_uri=`). Rules:
 - Must be `https://` in production.
 - `http://localhost` and `http://127.0.0.1` are allowed for local development.
 - Compared after URI normalization: lowercase scheme + host, implicit default ports stripped (`:443` for https, `:80` for http), trailing slashes stripped. This prevents bypasses via port variation or case differences.
+- **Query strings and fragments are ignored** during comparison — only `scheme://host:port/path` is compared. Registered redirect URIs must not rely on query parameters or fragments for identity. For example, `https://app.com/cb?v=1` and `https://app.com/cb?v=2` are treated as the same URI.
 
 ### emailVerified semantics for OAuth users
 
@@ -163,6 +213,11 @@ Critical security events are logged at `INFO` level with an `AUDIT` prefix for e
 | OAuth token exchanged | `AUDIT token_exchanged userId=… app=…` |
 | Token refreshed | `AUDIT token_refreshed userId=… app=…` |
 | Admin auth failure | `AUDIT admin_auth_failed reason=… ip=…` |
+| MFA enabled | `AUDIT mfa_enabled userId=…` |
+| MFA disabled | `AUDIT mfa_disabled userId=…` |
+| MFA verify success | `AUDIT mfa_verify_success userId=…` |
+| MFA verify failure | `AUDIT mfa_verify_failed userId=…` |
+| MFA backup code used | `AUDIT mfa_backup_code_used userId=…` |
 
 To stream audit events: `grep AUDIT <logfile>` or configure your log aggregator to filter on `AUDIT`.
 
@@ -175,8 +230,9 @@ To stream audit events: `grep AUDIT <logfile>` or configure your log aggregator 
 | `auth.admin-key` | `AUTH_ADMIN_KEY` | Key for `/auth/apps` endpoints (optional — disables app mgmt if unset) |
 | `auth.key-hmac-secret` | `AUTH_KEY_HMAC_SECRET` | HMAC-SHA256 secret for admin key hashing (min 32 chars, required in prod) |
 | `auth.state-hmac-secret` | `AUTH_STATE_HMAC_SECRET` | HMAC secret for signing OAuth state params (prevents open redirect / CSRF; required in prod) |
-| `auth.token-pepper` | `AUTH_TOKEN_PEPPER` | HMAC pepper for storing auth tokens and OAuth codes at rest (required in prod) |
+| `auth.token-pepper` | `AUTH_TOKEN_PEPPER` | HMAC pepper for storing auth tokens, OAuth codes, and MFA backup codes at rest; also used as AES key seed for MFA secret encryption (required in prod) |
 | `auth.session.cookie-domain` | `AUTH_SESSION_COOKIE_DOMAIN` | Cookie domain for `platform_session` (e.g. `.homelab.local`; empty for localhost) |
+| `auth.mfa-hmac-secret` | `AUTH_MFA_HMAC_SECRET` | HMAC secret for signing MFA challenge tokens (separate from OAuth state; required in prod) |
 | `auth.rate-limit.enabled` | `AUTH_RATE_LIMIT_ENABLED` | Toggle rate limiting (default true) |
 | `auth.rate-limit.requests-per-minute` | `AUTH_RATE_LIMIT_RPM` | Per-IP limit for auth endpoints (default 60) |
 | `auth.oauth.google.client-id` | `GOOGLE_CLIENT_ID` | Google OAuth |
@@ -390,10 +446,81 @@ Tokens issued without `X-App-Id` have no `groups` claim. Tokens with `X-App-Id` 
 - `StartupGuard` now enforces a minimum length of 32 characters for all three HMAC secrets in prod, in addition to checking they are not the dev defaults.
 - Weak but non-default secrets (e.g. `"abc"`) are now rejected at boot.
 
+### Optional MFA / TOTP support (2026-03-30)
+
+**What was added:**
+- `TotpService` — RFC 6238 TOTP implementation using only JDK `javax.crypto.Mac` (HMAC-SHA1). Generates base32 secrets, `otpauth://` URIs for QR codes, and 6-digit codes with ±30s skew tolerance. Also generates 8 single-use backup/recovery codes.
+- `UserEntity` — three new columns: `mfa_enabled` (boolean), `mfa_secret` (base32 TOTP secret), `mfa_backup_codes` (comma-separated recovery codes).
+- `UserService` — MFA lifecycle methods: `setupMfa()`, `confirmMfa()`, `disableMfa()`, `getMfaSecret()`, `consumeBackupCode()`, `isMfaEnabled()`.
+- `AuthResource` — five new endpoints:
+  - `POST /auth/mfa/setup` (JWT required) — starts enrollment, returns secret + QR URI + recovery codes.
+  - `POST /auth/mfa/confirm` (JWT required) — verifies initial TOTP code, activates MFA.
+  - `POST /auth/mfa/disable` (JWT required) — disables MFA (requires valid TOTP or backup code).
+  - `POST /auth/mfa/verify` (public, MFA token required) — completes login with TOTP or backup code.
+  - `POST /auth/login` — modified to return `MfaChallengeResponse` instead of `AuthResponse` when user has MFA enabled.
+- `JwtFilter` — `/auth/mfa/setup`, `/auth/mfa/confirm`, `/auth/mfa/disable` added to `PROTECTED` set.
+- `V9__mfa.sql` — Flyway migration adding MFA columns to `users` table.
+- `MfaTest` — 11 tests covering setup, confirm, login challenge, TOTP verify, backup codes (single-use), disable, and backward compatibility.
+
+**Design decisions:**
+- MFA is optional — existing clients are unaffected unless users enable it.
+- Zero external dependencies — TOTP uses JDK crypto only.
+- MFA challenge token is HMAC-signed (not a JWT) with 5-minute TTL, using dedicated `auth.mfa-hmac-secret`.
+- Backup codes are consumed on use — each can only be used once.
+
+### MFA security hardening (2026-03-30)
+
+Addressed findings from security audit:
+
+**High — OAuth MFA bypass fixed:**
+- OAuth callback (JSON branch), OAuth redirect flow, and `POST /auth/token` code exchange now check `isMfaEnabled()` and return `MfaChallengeResponse` instead of a JWT for MFA-enabled users.
+- Redirect flow sends `?mfa_required=true&mfa_code=...` (opaque, single-use code) instead of `?code=...` when MFA is required. Client exchanges code via `POST /auth/mfa/challenge` for the actual `mfaToken` — token never appears in the URL.
+- MFA now protects the account uniformly across all login paths (password, Google, GitHub).
+
+**Medium fixes:**
+
+1. **MFA token replay eliminated** — MFA challenge tokens now include a single-use nonce registered in `MfaNonceStore` (in-memory, same pattern as `OAuthNonceStore`). Token is consumed on first use; replay within TTL returns "MFA token already used or expired."
+
+2. **Per-userId rate limit on /auth/mfa/verify** — Added 5 RPM per-userId rate limit (keyed `mfa:user:<userId>`) enforced after parsing the MFA token. Combined with per-IP limit, this prevents distributed brute force on 6-digit TOTP codes.
+
+3. **Dedicated MFA HMAC secret** — New `auth.mfa-hmac-secret` / `AUTH_MFA_HMAC_SECRET` config. MFA challenge tokens are now signed with a separate secret from OAuth state (`auth.state-hmac-secret`). Compromise of one does not forge the other. `StartupGuard` validates it in prod.
+
+4. **TOTP secrets encrypted at rest** — `mfa_secret` is now stored as AES-256-GCM ciphertext (`iv:ciphertext` in base64), encrypted with `SHA-256(AUTH_TOKEN_PEPPER)` as the key. A DB dump does not expose raw TOTP secrets.
+
+5. **Backup codes hashed at rest** — Backup codes are stored as `HMAC-SHA256(code, AUTH_TOKEN_PEPPER)` hashes (same pattern as auth tokens and OAuth codes). Verification computes the hash and compares. A DB dump cannot recover usable backup codes.
+
+### MFA follow-up fixes (2026-03-30)
+
+**Medium — MFA token removed from redirect URL:**
+- OAuth redirect flow for MFA-enabled users now sends an opaque `mfa_code` (60s, single-use, HMAC-hashed in DB via `auth_tokens` with type `mfa_challenge`) instead of the `mfaToken` in the query string.
+- New endpoint `POST /auth/mfa/challenge` (form-encoded `code=...`) exchanges the code for an `MfaChallengeResponse` over HTTPS. The `mfaToken` never appears in browser history, Referer headers, or proxy logs.
+
+**Low — Per-userId rate limit on /auth/mfa/confirm:**
+- `POST /auth/mfa/confirm` now enforces the same 5 RPM per-userId rate limit as `/auth/mfa/verify`, preventing TOTP guessing with a stolen session.
+
+**Low — confirmMfa no longer returns backup codes:**
+- `POST /auth/mfa/confirm` response is now `{ "message": "MFA enabled" }` only. Recovery codes are returned exclusively by `POST /auth/mfa/setup` — the single point where users should save them. Previously, confirm returned the HMAC hashes of the codes (useless to the user).
+
+**Documentation:**
+- Redirect URI comparison explicitly documented as `scheme://host:port/path` only — query strings and fragments are ignored.
+- Polymorphic response types documented for `POST /auth/login`, `POST /auth/token`, and `GET /auth/oauth/callback`: clients must check for `mfaRequired` to distinguish `AuthResponse` from `MfaChallengeResponse`.
+
+### MFA challenge appId binding and atomic token consumption (2026-03-30)
+
+**Medium — /auth/mfa/challenge now binds appId to the OAuth session:**
+- `auth_tokens` table gained an `app_id` column (V10 migration).
+- `createAuthToken()` accepts an optional `appId`, stored on the token row.
+- `oauthCallback` passes `appId` when creating `mfa_challenge` tokens.
+- `POST /auth/mfa/challenge` ignores client-supplied `X-App-Id` and uses the stored `app_id` from the token. An attacker with a leaked `mfa_code` cannot mint tokens for arbitrary apps.
+
+**Medium — consumeAuthToken is now atomic (double-spend race eliminated):**
+- `AuthTokenRepository.claimToken()` uses `UPDATE ... WHERE token = ? AND type = ? AND used = false AND expiresAt > ?` before SELECT (same pattern as `OAuthCodeRepository.claimCode()`).
+- `UserService.consumeAuthToken()` now delegates to `claimToken()` — two concurrent requests with the same code cannot both succeed.
+
 ### Known limitations and operational notes
 
 #### Single-instance constraints
-- **`OAuthNonceStore`** and **`RateLimiter`** are in-memory. With multiple instances, OAuth nonces are not shared (callbacks may fail if they hit a different instance than the redirect), and effective rate limits multiply by instance count. Use sticky sessions or a shared store (Redis) if scaling horizontally.
+- **`OAuthNonceStore`**, **`MfaNonceStore`**, and **`RateLimiter`** are in-memory. With multiple instances, OAuth nonces are not shared (callbacks may fail if they hit a different instance than the redirect), and effective rate limits multiply by instance count. Use sticky sessions or a shared store (Redis) if scaling horizontally.
 
 #### Logout and incident response
 - `POST /auth/logout?refresh_token=<token>` clears the `platform_session` cookie and revokes the provided refresh token. The `refresh_token` query param is optional for backward compatibility — if omitted, only the cookie is cleared. Access tokens remain valid until their 15-minute expiry (stateless).
