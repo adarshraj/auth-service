@@ -43,6 +43,8 @@ class OAuthService @Inject constructor(
         val email: String,
         val name: String,
         val avatarUrl: String?,
+        /** Whether the OAuth provider has verified ownership of this email address. */
+        val emailVerified: Boolean,
     )
 
     // ── Google ────────────────────────────────────────────────────────────────
@@ -82,6 +84,9 @@ class OAuthService @Inject constructor(
             email = userRes["email"]?.asText() ?: throw BadRequestException("Missing Google email"),
             name = userRes["name"]?.asText() ?: userRes["email"]!!.asText().substringBefore('@'),
             avatarUrl = userRes["picture"]?.asText(),
+            // Google's userinfo endpoint returns verified_email; default true if field is absent
+            // (all Google accounts require a verified email to exist)
+            emailVerified = userRes["verified_email"]?.asBoolean() ?: true,
         )
     }
 
@@ -113,23 +118,29 @@ class OAuthService @Inject constructor(
             ?: throw BadRequestException("GitHub token exchange failed")
 
         val userRes = getGithub("https://api.github.com/user", accessToken)
-        val email = userRes["email"]?.asText()?.takeIf { it.isNotBlank() }
-            ?: fetchGithubPrimaryEmail(accessToken)
+        // Always fetch from /user/emails to get the verified status — the /user endpoint
+        // does not expose email verification state, and GitHub allows unverified email accounts.
+        val emailResult = fetchGithubPrimaryEmail(accessToken)
 
         return OAuthUser(
             id = userRes["id"]?.asText() ?: throw BadRequestException("Missing GitHub user id"),
-            email = email,
-            name = userRes["name"]?.asText() ?: userRes["login"]?.asText() ?: email.substringBefore('@'),
+            email = emailResult.email,
+            name = userRes["name"]?.asText() ?: userRes["login"]?.asText() ?: emailResult.email.substringBefore('@'),
             avatarUrl = userRes["avatar_url"]?.asText(),
+            emailVerified = emailResult.verified,
         )
     }
 
-    private fun fetchGithubPrimaryEmail(accessToken: String): String {
+    private data class GitHubEmailResult(val email: String, val verified: Boolean)
+
+    private fun fetchGithubPrimaryEmail(accessToken: String): GitHubEmailResult {
         val emails = getGithub("https://api.github.com/user/emails", accessToken)
         if (emails.isArray) {
             val primary = emails.find { it["primary"]?.asBoolean() == true }
                 ?: emails.firstOrNull()
-            return primary?.get("email")?.asText() ?: throw BadRequestException("Email not available from GitHub")
+            val email = primary?.get("email")?.asText() ?: throw BadRequestException("Email not available from GitHub")
+            val verified = primary?.get("verified")?.asBoolean() ?: false
+            return GitHubEmailResult(email, verified)
         }
         throw BadRequestException("Email not available from GitHub")
     }

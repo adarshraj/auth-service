@@ -10,11 +10,14 @@ import java.util.Date
 
 /**
  * JWT sign/verify using ES256 (ECDSA P-256).
- * Token payload: { sub, userId, email, appId, aud, iat, exp }
+ * Token payload: { sub, userId, email, iss, iat, exp [, appId, aud, groups] }
+ *
+ * - `aud`    — set to appId when present; consuming services must validate to prevent cross-app token reuse.
+ * - `groups` — set to [role] (e.g. ["user"] or ["admin"]) when a role is provided; read by
+ *              Quarkus/MP-JWT for @RolesAllowed. Only present when the token is app-scoped.
  *
  * The public key is published at /.well-known/jwks.json so consuming services
  * can verify tokens without sharing a secret.
- * The `aud` claim is set to appId so each app can reject tokens scoped to other apps.
  */
 @ApplicationScoped
 class JwtService @Inject constructor(
@@ -35,7 +38,7 @@ class JwtService @Inject constructor(
         val appId: String?,
     )
 
-    fun sign(userId: String, email: String, appId: String?): String {
+    fun sign(userId: String, email: String, appId: String?, role: String? = null): String {
         val now = System.currentTimeMillis()
         val exp = now + expirySeconds * 1000L
         val builder = Jwts.builder()
@@ -49,6 +52,10 @@ class JwtService @Inject constructor(
         if (appId != null) {
             builder.claim("appId", appId)
             builder.audience().add(appId)
+        }
+        if (role != null) {
+            // MP-JWT / Quarkus @RolesAllowed reads the `groups` claim as a list
+            builder.claim("groups", listOf(role))
         }
         return builder.signWith(ecKeyService.privateKey).compact()
     }

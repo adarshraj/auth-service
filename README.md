@@ -11,6 +11,7 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 - JWT **ES256** tokens signed with a persisted EC P-256 key pair
 - Public JWKS endpoint — consuming services verify tokens using the public key, no shared secret needed
 - `aud` claim scoped to `appId` — a token issued for one app is rejected by any other app
+- `groups` claim with the user's app-level role — consuming Quarkus/MP-JWT services can use `@RolesAllowed` directly
 
 ## API
 
@@ -72,6 +73,23 @@ Verify the token signature using the EC P-256 public key (`alg: ES256`). Also va
 - `exp` is in the future
 
 No shared secret is needed. If the key pair is rotated, the `kid` field changes — re-fetch JWKS when you encounter an unknown `kid`.
+
+> **`aud` validation is mandatory.** A token issued for app A will be accepted by app B if `aud` is not checked. This is an account-isolation boundary — never skip it.
+
+### JWT payload reference
+
+| Claim | Always present | Description |
+|-------|---------------|-------------|
+| `sub` | Yes | userId |
+| `userId` | Yes | Same as `sub`; kept for backward compatibility |
+| `email` | Yes | User's email address |
+| `iss` | Yes | Auth-service base URL |
+| `aud` | When `X-App-Id` was passed | App ID the token is scoped to |
+| `groups` | When `X-App-Id` was passed | `["user"]` or `["admin"]` — the user's role for this app |
+| `kid` | Yes (JWT header) | Key ID; matches JWKS `kid` field |
+| `iat` / `exp` | Yes | Issued-at and expiry timestamps |
+
+`groups` is the standard claim read by Quarkus/MP-JWT for `@RolesAllowed`. Roles are managed via `POST /auth/apps/{appId}/access/{userId}` with a `{"role": "admin"}` body.
 
 > **Tokens without `aud`:** Tokens issued without `X-App-Id` have no `aud` claim and are broadly usable. Always pass `X-App-Id` in login/register/OAuth flows to scope tokens to your app.
 
@@ -183,20 +201,25 @@ ES256 provides stronger security with significantly less CPU cost at signing tim
 | JWT signing | ES256 (ECDSA P-256); private key persisted in DB, never leaves the process |
 | Token audience | `aud` claim set to `appId`; consuming services must validate to prevent cross-app reuse |
 | Token issuer | `iss` set to `AUTH_BASE_URL` (trailing slash stripped); consuming services must validate |
+| Token roles | `groups` claim set to `["user"]` or `["admin"]` from `user_app_access.role`; supports `@RolesAllowed` in Quarkus/MP-JWT |
 | Auth tokens at rest | Password-reset / magic-link tokens and OAuth codes stored as `HMAC(value, AUTH_TOKEN_PEPPER)` — plaintext never written to DB |
-| OAuth state | HMAC-signed with `AUTH_STATE_HMAC_SECRET` (`payload~sig`) to prevent redirectUri tampering / open redirect |
-| Admin key | Stored as `HMAC(key, AUTH_KEY_HMAC_SECRET)`, compared constant-time; hash pre-computed at startup |
-| Rate limiting | Per-IP (configurable RPM) + per-account (10 RPM) on login to block distributed brute force |
-| Redirect URIs | HTTPS enforced; validated at registration and at use time; exact-match only |
+| OAuth code exchange | Atomic `UPDATE ... WHERE used=false` marks the code used before returning it — eliminates the TOCTOU race where two concurrent requests could both redeem the same code |
+| OAuth state | HMAC-signed (`payload~sig`) + single-use nonce stored server-side. Both layers must pass: signature prevents tampering, nonce prevents CSRF and state replay |
+| Admin key | Stored as `HMAC(key, AUTH_KEY_HMAC_SECRET)`, compared constant-time; hash pre-computed at startup. All admin endpoints rate-limited at 20 RPM per IP |
+| Rate limiting | Per-IP (configurable RPM) + per-account (10 RPM) on login; 20 RPM per IP on admin endpoints. In-memory — effective for single-instance deployments |
+| Redirect URIs | HTTPS enforced; validated at registration and at use time; URI-normalized before comparison (lowercase host, default ports stripped) to prevent bypass via port variation |
+| OAuth email verification | `emailVerified` reflects provider truth: Google reads `verified_email`; GitHub calls `/user/emails` for the `verified` field — never assumed `true` |
 | OAuth account linking | Not automatic — requires authenticated link flow to prevent email-based account takeover |
+| 5xx error responses | Internal error details never sent to the client — logged server-side only |
 | OpenAPI/Swagger | Disabled in `prod` profile |
 | Login error messages | Generic "Invalid email or password" for all failures — does not reveal whether email is registered or OAuth-only |
 | Deleted-user guard | `POST /auth/token` rejects a valid code if the account was deleted after code issuance |
+| Audit logging | Critical events (login success/failure, account deletion, token exchange, admin auth failures) logged at INFO with an `AUDIT` prefix |
 
 ### By-design / operational notes
 
 - **`/auth/me` and `/auth/account` are app-agnostic** — they return the global user identity and do not enforce `aud`. This is intentional: these routes serve any valid JWT regardless of which app issued it. If you need per-app identity binding on these routes, pass `X-App-Id` and validate `aud` in your own middleware.
-- **Redirect URI exact-match** — `https://app/cb` and `https://app/cb/` are treated as different URIs. Register URIs exactly as your app will use them.
+- **Redirect URI normalization** — URIs are compared after lowercasing the host, stripping default ports (`:443` for https, `:80` for http), and trimming trailing slashes. `https://app/cb` and `https://app/cb/` are treated as the same URI.
 - **JWT lifetime (7 days)** and **bcrypt cost 10** are policy choices tuned for a personal low-resource server. Tighten `AUTH_JWT_EXPIRY_SECONDS` or bcrypt cost if your threat model requires it.
 - **No PKCE** — acceptable for confidential clients (server-to-server). Add PKCE before supporting mobile or SPA public clients.
 - **OAuth state size** — grows with long `redirect_uri` values. All major providers tolerate the current size; no action needed unless you hit provider limits.

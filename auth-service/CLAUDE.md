@@ -42,7 +42,7 @@ Layered under `src/main/kotlin/com/authservice/`:
 - **`api/`** — JAX-RS resources (`AuthResource`, `AppResource`, `WellKnownResource`), DTOs, and exception mappers. Resources delegate all logic to services.
 - **`service/`** — Business logic: `UserService` (registration, login, OAuth account linking, access management, auth tokens), `JwtService` (sign/verify ES256), `EcKeyService` (generate/persist/expose EC P-256 key pair), `PasswordService` (bcrypt), `OAuthService` (Google + GitHub flows), `TokenCleanupJob` (scheduled purge).
 - **`domain/`** — JPA entities and Panache repositories: `UserEntity`, `AppEntity`, `UserAppAccessEntity` (composite PK), `AuthTokenEntity`, `EcKeyEntity`, `OAuthCodeEntity`.
-- **`security/`** — `JwtFilter` (protects `/auth/me` and `/auth/account`), `RateLimiter` (in-memory fixed-window), `ApiKeyHasher` (HMAC-SHA256 for admin key), `CallerContext` (request-scoped user identity), `StartupGuard` (validates required secrets on boot).
+- **`security/`** — `JwtFilter` (protects `/auth/me` and `/auth/account`), `RateLimiter` (in-memory fixed-window), `OAuthNonceStore` (single-use nonce validation for OAuth CSRF protection), `ApiKeyHasher` (HMAC-SHA256 for admin key), `CallerContext` (request-scoped user identity), `StartupGuard` (validates required secrets on boot).
 - **`config/`** — `RateLimitConfig` and `OAuthConfig` ConfigMapping interfaces.
 
 ### Key flows
@@ -59,7 +59,7 @@ Layered under `src/main/kotlin/com/authservice/`:
 
 **Per-app gate:** If `apps.requires_explicit_access = true`, login is blocked unless a `user_app_access` row exists. Auto-granted on first register/OAuth into that app.
 
-**JWT verification in other services:** Fetch public key from `GET /.well-known/jwks.json`, verify ES256 signature, validate `aud` claim matches app ID. Token payload: `{sub, userId, email, appId, aud, iat, exp}`.
+**JWT verification in other services:** Fetch public key from `GET /.well-known/jwks.json`, verify ES256 signature, validate `aud` claim matches app ID. Token payload: `{sub, userId, email, groups, appId, aud, iat, exp}`.
 
 ### Database schema (Flyway migrations)
 
@@ -68,7 +68,7 @@ Layered under `src/main/kotlin/com/authservice/`:
 | V1 | `users` | Core user record — id, email, name, password_hash, avatar_url, oauth_provider, oauth_id, email_verified |
 | V2 | `apps` | Registered apps — id (e.g. `finance-tracker`), name, requires_explicit_access |
 | V3 | `user_app_access` | Per-user app grants — composite PK (user_id, app_id), role, granted_at |
-| V4 | `auth_tokens` | One-time tokens — type (`password_reset`, `magic_link`, `email_verification`), expires_at, used |
+| V4 | `auth_tokens` | One-time tokens — type (`password_reset`, `magic_link`, `email_verification`), expires_at, used (reserved for future endpoints) |
 | V5 | `apps.redirect_uris` | Newline-separated allowed redirect URIs per app |
 | V6 | `ec_keys` | Persisted EC P-256 key pair (single row, id=`primary`) |
 | V7 | `oauth_codes` | Short-lived one-time codes for the OAuth browser redirect flow (60s TTL) |
@@ -77,15 +77,23 @@ Layered under `src/main/kotlin/com/authservice/`:
 
 The `X-Admin-Key` header value is never stored raw. The hash of the configured key is pre-computed once at startup (`AppResource.configuredKeyHash` lazy val). On each request `ApiKeyHasher.verify(provided, storedHash)` computes `HMAC(provided)` and compares via `MessageDigest.isEqual()` (constant-time). This prevents both timing attacks and repeated hashing overhead.
 
+All admin endpoints are rate-limited at 20 RPM per IP (`AppResource.ADMIN_RPM`). Failed authentication attempts are logged with `AUDIT admin_auth_failed`.
+
 **Admin API is disabled** (returns 501) if `AUTH_ADMIN_KEY` is not set. Apps still work — only the `/auth/apps` management endpoints are gated.
 
 ### Auth token and OAuth code security
 
 `auth_tokens` and `oauth_codes` are stored as `HMAC(value, AUTH_TOKEN_PEPPER)`, not plaintext. `UserService.createAuthToken()` and `AuthResource.issueOAuthCode()` return the raw value to the caller and store only the hash; lookup hashes the incoming value before querying. A full DB dump does not expose redeemable tokens or codes.
 
-### OAuth state integrity
+OAuth code exchange (`POST /auth/token`) uses `OAuthCodeRepository.claimCode()` which atomically marks the code used via `UPDATE ... WHERE used=false` before returning it. This eliminates the TOCTOU race where two concurrent requests could both exchange the same one-time code.
 
-The OAuth state parameter is HMAC-signed: `base64url(payload)~hmac_hex`. `AuthResource.buildOAuthState()` appends the signature; `parseOAuthState()` verifies it with constant-time comparison before decoding. This prevents an attacker from swapping the `redirectUri` field in-flight (open redirect) or injecting a provider value.
+### OAuth state integrity and CSRF protection
+
+The OAuth state parameter uses two independent layers of protection:
+
+1. **HMAC signature** — `base64url(payload)~hmac_hex`. `AuthResource.buildOAuthState()` appends the signature; `parseOAuthState()` verifies it with constant-time comparison before decoding. Prevents an attacker from tampering with the `redirectUri`, `provider`, or `appId` fields in-flight.
+
+2. **Single-use nonce** — A 16-byte random nonce is embedded in the state payload, registered in `OAuthNonceStore` when the OAuth flow starts, and consumed (removed) when the callback arrives. Even a valid HMAC-signed state can only be used once within its 10-minute TTL. This prevents CSRF and state-replay attacks.
 
 ### Rate limiting and reverse proxy
 
@@ -95,16 +103,43 @@ Rate limiting uses the **rightmost** `X-Forwarded-For` entry (set by the trusted
 
 Login is rate-limited twice: per-IP (global RPM from config) and per-account (hard-coded 10 RPM) to defend against distributed brute force from multiple IPs.
 
+Admin endpoints are rate-limited at 20 RPM per IP independently of the auth rate limits.
+
+**Known limitation:** The rate limiter is in-memory (`RateLimiter` uses `ConcurrentHashMap`). In a horizontally-scaled deployment with multiple instances, each instance tracks limits independently — the effective limit per IP is `RPM × instance count`. For single-instance deployments (the intended use case for a personal auth service) this is not a concern. If you scale horizontally, replace with a shared Redis-backed implementation.
+
 ### Redirect URI policy
 
 Redirect URIs are validated at both registration time (`POST /auth/apps`) and use time (`GET /auth/oauth/{provider}?redirect_uri=`). Rules:
 - Must be `https://` in production.
 - `http://localhost` and `http://127.0.0.1` are allowed for local development.
-- Must exactly match a URI registered for the app — no prefix matching.
+- Compared after URI normalization: lowercase scheme + host, implicit default ports stripped (`:443` for https, `:80` for http), trailing slashes stripped. This prevents bypasses via port variation or case differences.
+
+### emailVerified semantics for OAuth users
+
+`users.email_verified` is set based on what the OAuth provider reports — not hardcoded `true`:
+
+- **Google** — reads `verified_email` from `/oauth2/v2/userinfo`; defaults to `true` if the field is absent (all active Google accounts have a verified email).
+- **GitHub** — always calls `/user/emails` to get the primary email's `verified` field. The `/user` endpoint does not expose verification status, and GitHub allows unverified email accounts.
+
+Do not assume `emailVerified = true` for OAuth users without checking the provider.
 
 ### EC key pair lifecycle
 
 `EcKeyService` observes `StartupEvent` and either loads the existing key pair from the `ec_keys` table or generates a new one (on first boot). The private key never leaves the process. `kid` is a random UUID stored alongside the key and included in each JWT header and JWKS response. If the DB is wiped, a new key pair is generated — all existing tokens will become invalid.
+
+### Audit logging
+
+Critical security events are logged at `INFO` level with an `AUDIT` prefix for easy grep/aggregation:
+
+| Event | Log pattern |
+|-------|-------------|
+| Login success | `AUDIT login_success userId=… app=…` |
+| Login failure | `AUDIT login_failed reason=… userId/email=… app=…` |
+| Account deleted | `AUDIT account_deleted userId=… email=…` |
+| OAuth token exchanged | `AUDIT token_exchanged userId=… app=…` |
+| Admin auth failure | `AUDIT admin_auth_failed reason=… ip=…` |
+
+To stream audit events: `grep AUDIT <logfile>` or configure your log aggregator to filter on `AUDIT`.
 
 ## Configuration
 
@@ -116,7 +151,7 @@ Redirect URIs are validated at both registration time (`POST /auth/apps`) and us
 | `auth.state-hmac-secret` | `AUTH_STATE_HMAC_SECRET` | HMAC secret for signing OAuth state params (prevents open redirect / CSRF; required in prod) |
 | `auth.token-pepper` | `AUTH_TOKEN_PEPPER` | HMAC pepper for storing auth tokens and OAuth codes at rest (required in prod) |
 | `auth.rate-limit.enabled` | `AUTH_RATE_LIMIT_ENABLED` | Toggle rate limiting (default true) |
-| `auth.rate-limit.requests-per-minute` | `AUTH_RATE_LIMIT_RPM` | Per-IP limit (default 60) |
+| `auth.rate-limit.requests-per-minute` | `AUTH_RATE_LIMIT_RPM` | Per-IP limit for auth endpoints (default 60) |
 | `auth.oauth.google.client-id` | `GOOGLE_CLIENT_ID` | Google OAuth |
 | `auth.oauth.google.client-secret` | `GOOGLE_CLIENT_SECRET` | Google OAuth |
 | `auth.oauth.github.client-id` | `GITHUB_CLIENT_ID` | GitHub OAuth |
@@ -127,6 +162,8 @@ Redirect URIs are validated at both registration time (`POST /auth/apps`) and us
 | `quarkus.datasource.password` | `QUARKUS_DATASOURCE_PASSWORD` | DB password (prod only) |
 
 **Dev profile:** SQLite at `./authservice-dev.db`. **Test profile:** In-memory SQLite, rate limiting disabled. **Prod profile:** SQLite by default — mount a persistent volume for the `.db` file. `StartupGuard` throws on boot if any of the three HMAC secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`) are at their default dev values. PostgreSQL is supported but optional.
+
+**Note on dev secret defaults:** The JAR contains the dev default values for the three HMAC secrets. `StartupGuard` blocks prod startup if these defaults are detected, but a misconfigured deployment (missing env vars in prod) would use predictable secrets. Always verify env vars are set before promoting a build.
 
 ## Code patterns
 
@@ -141,10 +178,12 @@ Redirect URIs are validated at both registration time (`POST /auth/apps`) and us
 - Add a string constant for the type (e.g. `"email_verification"`).
 - Call `userService.createAuthToken(userId, type, ttlHours)` to generate; call `userService.consumeAuthToken(token, type)` to validate and mark used.
 - The `TokenCleanupJob` automatically purges tokens older than 30 days.
+- Note: `auth_tokens` infrastructure exists in the DB (V4 migration) but no REST endpoints currently expose it — it is reserved for future password-reset / magic-link / email-verification flows.
 
 **Exception handling:**
 - Throw standard JAX-RS exceptions (`NotAuthorizedException`, `ForbiddenException`, `NotFoundException`, `BadRequestException`) from services — `NormalizedExceptionMappers` catches them and returns `{"error": "...", "message": "...", "status": N}`.
 - Never return raw error strings from resources.
+- 5xx responses return a generic `"An internal error occurred"` message to the client; the original message is logged server-side only.
 
 ## bcrypt compatibility
 
@@ -159,11 +198,14 @@ Redirect URIs are validated at both registration time (`POST /auth/apps`) and us
 - `iss` — issuer, set to `auth.base-url` (e.g. `https://auth.example.com`). Consuming services should validate this.
 - `aud` — set to `appId` when present. Consuming services **must** validate this to prevent cross-app token reuse. Tokens without `aud` are app-agnostic (issued without `X-App-Id`).
 - `kid` — key ID in the JWT header; matches the `kid` field in the JWKS response. Re-fetch JWKS when you encounter an unknown `kid`.
+- `groups` — list containing the user's role for the given app (e.g. `["user"]` or `["admin"]`). Only present when `appId` is set and the user has a `user_app_access` row. Consuming services using Quarkus/MP-JWT can use `@RolesAllowed` against this claim directly.
 - `iat` / `exp` — issued-at and expiry timestamps.
 
 Tokens are signed with ES256 (ECDSA P-256). Verify using the public key from `GET /.well-known/jwks.json`.
 
 **Consuming services should validate:** `iss` equals their known auth-service URL, `aud` equals their app ID, `exp` is in the future, and `kid` matches a known key in the JWKS.
+
+> **CRITICAL — aud validation is the consuming service's responsibility.** The auth-service correctly sets `aud` to the `appId`, but does not enforce that consuming services check it. A consuming service that skips `aud` validation will accept tokens issued for any other app. This is an account-isolation boundary — always validate `aud`.
 
 **Note on tokens without `aud`:** Tokens issued via login/register without `X-App-Id` have no `aud` claim. They are broadly usable across any service that trusts this auth-service. Avoid issuing these in multi-tenant contexts — always pass `X-App-Id`.
 
@@ -193,3 +235,63 @@ The change is isolated to `EcKeyService` and `JwtService` — no DB schema chang
 3. **`EcKeyEntity`** / **DB** — column names (`private_key_pkcs8`, `public_key_x509`) stay the same; only the stored bytes change. A DB wipe or migration to clear the old EC key row is needed so the new RSA key pair is generated on next boot.
 
 That is the full scope — roughly 20 lines changed in `EcKeyService`.
+
+## Change log
+
+### groups/role claim in JWT (2026-03-30)
+
+**Problem:** `@RolesAllowed("user")` in consuming Quarkus services requires a `groups` claim in the JWT. The auth-service was not emitting one.
+
+**What was added:**
+- `UserAppAccessRepository.findRole(userId, appId)` — looks up the user's role for an app.
+- `UserService.getRole(userId, appId)` — exposes it to the resource layer.
+- `JwtService.sign(..., role: String?)` — emits `"groups": [role]` when role is non-null.
+- All four token-issuing paths in `AuthResource` (register, login, OAuth direct callback, token exchange) now look up the role and pass it to `sign()`.
+
+Tokens issued without `X-App-Id` have no `groups` claim. Tokens with `X-App-Id` include `"groups": ["user"]` or `"groups": ["admin"]`.
+
+### Security hardening (2026-03-30)
+
+#### Critical fixes
+
+**1. OAuth code TOCTOU race eliminated**
+- `OAuthCodeRepository.claimCode()` — atomically marks the code used via `UPDATE ... WHERE used=false AND expiresAt > now` before returning the entity. If the UPDATE affects 0 rows, the code was already used or expired. `AuthResource.exchangeToken()` now calls `claimCode()` instead of the previous select-then-update pattern, which had a race where two concurrent requests could both exchange the same one-time code.
+
+**2. Admin key brute-force protection**
+- `AppResource` now injects `RateLimiter` and `ContainerRequestContext`.
+- `checkAdmin()` rate-limits all admin endpoint requests at 20 RPM per IP (keyed `admin:ip:<ip>`), regardless of whether the key is correct. Failed auth attempts are logged with `AUDIT admin_auth_failed`.
+
+**3. OAuth state nonce — single-use enforcement**
+- New `OAuthNonceStore` (`security/OAuthNonceStore.kt`) — in-memory `ConcurrentHashMap<nonce, expiry>` with 10-minute TTL and 5-minute scheduled eviction.
+- `buildOAuthState()` registers the nonce; `parseOAuthState()` consumes it. A state whose nonce is missing or expired is rejected even if the HMAC signature is valid. This closes the CSRF / state-replay vector.
+
+#### High fixes
+
+**4. OAuth `emailVerified` reflects provider truth**
+- `OAuthService.OAuthUser` gained an `emailVerified: Boolean` field.
+- Google: reads `verified_email` from `/oauth2/v2/userinfo` (defaults `true` if absent).
+- GitHub: always calls `/user/emails` and reads the primary email's `verified` field. Previously `emailVerified` was hardcoded `true` for all OAuth users, which was incorrect for GitHub accounts with unverified emails.
+- `UserService.findOrCreateByOAuth()` gained an `emailVerified` parameter; `AuthResource.oauthCallback()` passes `oauthUser.emailVerified`.
+
+**5. Redirect URI comparison URI-normalized**
+- `AuthResource.validateRedirectUri()` now normalizes both the incoming URI and all registered URIs before comparing: lowercase scheme + host, implicit ports stripped (443/https, 80/http), trailing slashes stripped.
+- Prevents bypasses like `https://example.com:443/cb` vs `https://example.com/cb`.
+
+#### Medium fixes
+
+**6. 5xx responses no longer leak internal details**
+- `WebApplicationExceptionMapper` returns `"An internal error occurred"` for any HTTP 5xx response; the original message is logged server-side. 4xx messages are unchanged (they are crafted by application code and intentionally user-facing).
+
+**7. Audit logging added**
+- Login success/failure (with reason), account deletion, OAuth token exchange, and admin auth failures are now logged with an `AUDIT` prefix at INFO level for easy filtering.
+
+#### Documentation
+
+**8. JWT `aud` validation warning**
+- CLAUDE.md now contains a prominent CRITICAL note that consuming services are responsible for validating the `aud` claim. Skipping this check allows cross-app token reuse.
+
+**9. Rate limiter single-instance limitation documented**
+- Known limitation: in-memory rate limiter is not shared across instances in a horizontally-scaled deployment. Documented in CLAUDE.md; not a concern for the intended single-instance personal-use deployment.
+
+**10. `auth_tokens` dead code documented**
+- The `auth_tokens` table (V4 migration) and `UserService.createAuthToken/consumeAuthToken` exist for future password-reset / magic-link flows. No REST endpoints currently expose them. Documented as reserved.

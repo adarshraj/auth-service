@@ -8,6 +8,7 @@ import com.authservice.domain.AppEntity
 import com.authservice.domain.AppRepository
 import com.authservice.domain.UserAppAccessEntity
 import com.authservice.security.ApiKeyHasher
+import com.authservice.security.RateLimiter
 import com.authservice.service.UserService
 import jakarta.inject.Inject
 import jakarta.transaction.Transactional
@@ -23,6 +24,9 @@ import jakarta.ws.rs.POST
 import jakarta.ws.rs.Path
 import jakarta.ws.rs.PathParam
 import jakarta.ws.rs.Produces
+import jakarta.ws.rs.WebApplicationException
+import jakarta.ws.rs.container.ContainerRequestContext
+import jakarta.ws.rs.core.Context
 import jakarta.ws.rs.core.MediaType
 import jakarta.ws.rs.core.Response
 import org.eclipse.microprofile.config.inject.ConfigProperty
@@ -41,11 +45,17 @@ class AppResource @Inject constructor(
     private val appRepository: AppRepository,
     private val userService: UserService,
     private val hasher: ApiKeyHasher,
+    private val rateLimiter: RateLimiter,
     @ConfigProperty(name = "auth.admin-key") private val adminKey: Optional<String>,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(AppResource::class.java)
+        // Generous enough for legitimate admin use; tight enough to slow brute force
+        private const val ADMIN_RPM = 20
     }
+
+    @Context
+    private lateinit var requestContext: ContainerRequestContext
 
     // Pre-computed hash of the configured admin key — avoids re-hashing on every request
     private val configuredKeyHash: String? by lazy {
@@ -148,10 +158,29 @@ class AppResource @Inject constructor(
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun checkAdmin(provided: String?) {
+        // Rate-limit all admin requests per IP — limits brute-force to ADMIN_RPM attempts/min
+        val ip = requestContext.getHeaderString("X-Forwarded-For")
+            ?.split(",")?.last()?.trim()
+            ?: requestContext.getHeaderString("X-Real-IP")
+            ?: "unknown"
+        if (!rateLimiter.tryAcquire("admin:ip:$ip", ADMIN_RPM)) {
+            throw WebApplicationException(
+                Response.status(429)
+                    .type(MediaType.APPLICATION_JSON)
+                    .header("Retry-After", "60")
+                    .entity(mapOf("error" to "too_many_requests", "message" to "Too many requests. Try again later.", "status" to 429))
+                    .build()
+            )
+        }
+
         val storedHash = configuredKeyHash
             ?: throw NotSupportedException("Admin API is disabled — set AUTH_ADMIN_KEY to enable it")
-        if (provided.isNullOrBlank()) throw NotAuthorizedException("Missing X-Admin-Key", "Admin")
+        if (provided.isNullOrBlank()) {
+            log.warnf("AUDIT admin_auth_failed reason=missing_key ip=%s", ip)
+            throw NotAuthorizedException("Missing X-Admin-Key", "Admin")
+        }
         if (!hasher.verify(provided, storedHash)) {
+            log.warnf("AUDIT admin_auth_failed reason=invalid_key ip=%s", ip)
             throw NotAuthorizedException("Invalid X-Admin-Key", "Admin")
         }
     }

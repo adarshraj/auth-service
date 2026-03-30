@@ -81,20 +81,26 @@ class UserService @Inject constructor(
 
     @Transactional
     fun login(email: String, password: String, appId: String?): UserView {
-        val user = userRepository.findByEmail(email.lowercase().trim())
-            ?: throw NotAuthorizedException("Invalid email or password", "Bearer")
+        val normalizedEmail = email.lowercase().trim()
+        val user = userRepository.findByEmail(normalizedEmail)
+            ?: run {
+                log.infof("AUDIT login_failed reason=unknown_email email=%s app=%s", normalizedEmail, appId ?: "none")
+                throw NotAuthorizedException("Invalid email or password", "Bearer")
+            }
 
         if (user.passwordHash == null) {
             // Generic message — do not reveal that this email is registered via OAuth only (account enumeration)
+            log.infof("AUDIT login_failed reason=no_password userId=%s app=%s", user.id, appId ?: "none")
             throw NotAuthorizedException("Invalid email or password", "Bearer")
         }
 
         if (!passwordService.verify(password, user.passwordHash!!)) {
+            log.infof("AUDIT login_failed reason=bad_password userId=%s app=%s", user.id, appId ?: "none")
             throw NotAuthorizedException("Invalid email or password", "Bearer")
         }
 
         checkAppAccess(user, appId)
-        log.infof("Login user id=%s app=%s", user.id, appId ?: "none")
+        log.infof("AUDIT login_success userId=%s app=%s", user.id, appId ?: "none")
         return user.toView()
     }
 
@@ -108,6 +114,7 @@ class UserService @Inject constructor(
         name: String,
         avatarUrl: String?,
         appId: String?,
+        emailVerified: Boolean,
     ): UserView {
         // Match by OAuth identity first
         var user = userRepository.findByOAuth(provider, oauthId)
@@ -137,7 +144,9 @@ class UserService @Inject constructor(
                 this.oauthProvider = provider
                 this.oauthId = oauthId
                 this.avatarUrl = avatarUrl
-                this.emailVerified = true
+                // Use the verification status reported by the OAuth provider.
+                // Google always verifies; GitHub requires an explicit check via /user/emails.
+                this.emailVerified = emailVerified
                 this.createdAt = Instant.now()
                 this.updatedAt = Instant.now()
             }
@@ -164,8 +173,8 @@ class UserService @Inject constructor(
     @Transactional
     fun deleteAccount(userId: String) {
         val user = userRepository.findById(userId) ?: throw NotFoundException("User not found")
+        log.infof("AUDIT account_deleted userId=%s email=%s", user.id, user.email)
         userRepository.delete(user)
-        log.infof("Deleted account id=%s", userId)
     }
 
     // ── App access management (called from AppResource) ───────────────────────
@@ -185,6 +194,9 @@ class UserService @Inject constructor(
             throw NotFoundException("Access record not found")
         }
     }
+
+    fun getRole(userId: String, appId: String): String? =
+        accessRepository.findRole(userId, appId)
 
     fun listAccessByApp(appId: String): List<UserAppAccessEntity> =
         accessRepository.findByApp(appId)

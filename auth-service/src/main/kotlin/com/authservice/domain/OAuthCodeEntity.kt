@@ -40,5 +40,21 @@ class OAuthCodeEntity {
 @ApplicationScoped
 class OAuthCodeRepository : PanacheRepositoryBase<OAuthCodeEntity, String> {
     fun findByCode(code: String): OAuthCodeEntity? = find("code", code).firstResult()
+
+    /**
+     * Atomically marks the code as used and returns it — or returns null if the code
+     * doesn't exist, is already used, or has expired.
+     *
+     * Uses an UPDATE-before-SELECT pattern to eliminate the TOCTOU race where two
+     * concurrent requests could both read `used=false`, both proceed, and both produce
+     * a JWT from the same one-time code. Only the request whose UPDATE affects 1 row wins.
+     */
+    fun claimCode(code: String): OAuthCodeEntity? {
+        val updated = update("used = true WHERE code = ?1 AND used = false AND expiresAt > ?2",
+            code, Instant.now())
+        if (updated == 0) return null
+        return find("code", code).firstResult()
+    }
+
     fun deleteExpiredBefore(cutoff: Instant): Long = delete("expiresAt < ?1", cutoff)
 }

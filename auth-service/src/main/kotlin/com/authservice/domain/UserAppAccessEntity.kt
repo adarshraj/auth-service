@@ -52,6 +52,9 @@ class UserAppAccessRepository : PanacheRepository<UserAppAccessEntity> {
     fun findByUser(userId: String): List<UserAppAccessEntity> =
         list("id.userId", userId)
 
+    fun findRole(userId: String, appId: String): String? =
+        find("id.userId = ?1 and id.appId = ?2", userId, appId).firstResult()?.role
+
     fun deleteAccess(userId: String, appId: String): Boolean {
         val entity = find("id.userId = ?1 and id.appId = ?2", userId, appId).firstResult()
             ?: return false

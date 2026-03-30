@@ -20,9 +20,11 @@ class WebApplicationExceptionMapper : ExceptionMapper<WebApplicationException> {
     override fun toResponse(exception: WebApplicationException): Response {
         val r = exception.response
         val status = r.status
-        val message = exception.message?.takeIf { it.isNotBlank() } ?: r.statusInfo.reasonPhrase
-        if (status >= 500) log.warnf(exception, "HTTP %d: %s", status, message)
-        return json(status, errorCode(status), message)
+        val rawMessage = exception.message?.takeIf { it.isNotBlank() } ?: r.statusInfo.reasonPhrase
+        if (status >= 500) log.warnf(exception, "HTTP %d: %s", status, rawMessage)
+        // Never forward internal details for 5xx — log them server-side only
+        val clientMessage = if (status >= 500) "An internal error occurred" else rawMessage
+        return json(status, errorCode(status), clientMessage)
     }
 }
 

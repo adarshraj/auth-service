@@ -10,6 +10,7 @@ import com.authservice.domain.OAuthCodeRepository
 import com.authservice.security.CallerContext
 import com.authservice.security.Hmac
 import com.authservice.security.JwtFilter
+import com.authservice.security.OAuthNonceStore
 import com.authservice.security.RateLimiter
 import com.authservice.service.JwtService
 import com.authservice.service.OAuthService
@@ -56,6 +57,7 @@ class AuthResource @Inject constructor(
     private val rateLimiter: RateLimiter,
     private val appRepository: AppRepository,
     private val oauthCodeRepository: OAuthCodeRepository,
+    private val nonceStore: OAuthNonceStore,
     // Purpose-specific secrets — each has its own env var to limit blast radius if one leaks
     @ConfigProperty(name = "auth.state-hmac-secret") private val stateHmacSecret: String,
     @ConfigProperty(name = "auth.token-pepper") private val tokenPepper: String,
@@ -85,7 +87,8 @@ class AuthResource @Inject constructor(
             name = body.name,
             appId = appId,
         )
-        val token = jwtService.sign(user.id, user.email, appId)
+        val role = appId?.let { userService.getRole(user.id, it) }
+        val token = jwtService.sign(user.id, user.email, appId, role)
         return Response.status(201).entity(AuthResponse(token, user.toResponse())).build()
     }
 
@@ -103,7 +106,8 @@ class AuthResource @Inject constructor(
         // Per-account limit: catches distributed brute force that rotates IPs to bypass per-IP limit
         checkRateLimit("auth:account:${body.email.lowercase().trim()}", PER_ACCOUNT_RPM)
         val user = userService.login(body.email, body.password, appId)
-        val token = jwtService.sign(user.id, user.email, appId)
+        val role = appId?.let { userService.getRole(user.id, it) }
+        val token = jwtService.sign(user.id, user.email, appId, role)
         return AuthResponse(token, user.toResponse())
     }
 
@@ -192,6 +196,7 @@ class AuthResource @Inject constructor(
             name = oauthUser.name,
             avatarUrl = oauthUser.avatarUrl,
             appId = appId,
+            emailVerified = oauthUser.emailVerified,
         )
 
         return if (redirectUri != null) {
@@ -200,7 +205,8 @@ class AuthResource @Inject constructor(
             val location = UriBuilder.fromUri(redirectUri).queryParam("code", authCode).build()
             Response.temporaryRedirect(location).build()
         } else {
-            val token = jwtService.sign(user.id, user.email, appId)
+            val role = appId?.let { userService.getRole(user.id, it) }
+            val token = jwtService.sign(user.id, user.email, appId, role)
             Response.ok(AuthResponse(token, user.toResponse())).build()
         }
     }
@@ -217,17 +223,17 @@ class AuthResource @Inject constructor(
         @Context ctx: ContainerRequestContext,
     ): AuthResponse {
         checkRateLimit(ctx)
-        // Lookup by HMAC of code — plaintext never stored in DB
-        val entity = oauthCodeRepository.findByCode(Hmac.sha256(code, tokenPepper))
-            ?: throw BadRequestException("Invalid auth code")
-        if (entity.used) throw BadRequestException("Auth code already used")
-        if (Instant.now().isAfter(entity.expiresAt)) throw BadRequestException("Auth code expired")
-        // Load user before marking code used — transient errors won't burn the code unnecessarily
+        // claimCode atomically marks the code used via UPDATE-before-SELECT,
+        // eliminating the TOCTOU race where two concurrent requests could both
+        // exchange the same one-time code before either marked it used.
+        val entity = oauthCodeRepository.claimCode(Hmac.sha256(code, tokenPepper))
+            ?: throw BadRequestException("Invalid or expired auth code")
         val user = try { userService.getById(entity.userId) }
             catch (e: jakarta.ws.rs.NotFoundException) { throw BadRequestException("Invalid auth code") }
-        entity.used = true
 
-        val token = jwtService.sign(entity.userId, entity.email, entity.appId)
+        val role = entity.appId?.let { userService.getRole(entity.userId, it) }
+        val token = jwtService.sign(entity.userId, entity.email, entity.appId, role)
+        log.infof("AUDIT token_exchanged userId=%s app=%s", entity.userId, entity.appId ?: "none")
         return AuthResponse(token, user.toResponse())
     }
 
@@ -273,10 +279,13 @@ class AuthResource @Inject constructor(
 
     /** Encode provider + appId + redirectUri into a signed OAuth state param.
      *  Format: base64url(provider\nappId\nnonce[\nredirectUri])~hmac
-     *  Uses auth.state-hmac-secret (separate from admin key and token pepper). */
+     *  Uses auth.state-hmac-secret (separate from admin key and token pepper).
+     *  The nonce is registered in OAuthNonceStore so it can only be consumed once
+     *  at callback time — preventing CSRF and state-replay attacks. */
     private fun buildOAuthState(provider: String, appId: String?, redirectUri: String?): String {
         val nonce = ByteArray(16).also { secureRandom.nextBytes(it) }
             .joinToString("") { "%02x".format(it) }
+        nonceStore.register(nonce)
         val parts = listOfNotNull(provider, appId ?: "", nonce, redirectUri)
         val payload = java.util.Base64.getUrlEncoder().withoutPadding()
             .encodeToString(parts.joinToString("\n").toByteArray())
@@ -284,7 +293,7 @@ class AuthResource @Inject constructor(
         return "$payload~$sig"
     }
 
-    /** Decode and verify a signed OAuth state param. Rejects missing, tampered, or malformed state. */
+    /** Decode and verify a signed OAuth state param. Rejects missing, tampered, replayed, or malformed state. */
     private fun parseOAuthState(state: String?): Triple<String, String?, String?> {
         if (state.isNullOrBlank()) throw BadRequestException("Missing OAuth state parameter")
         val tildeIdx = state.lastIndexOf('~')
@@ -301,6 +310,9 @@ class AuthResource @Inject constructor(
             val provider = parts[0].takeIf { it.isNotBlank() }
                 ?: throw BadRequestException("Invalid OAuth state parameter")
             val appId = parts[1].takeIf { it.isNotBlank() }
+            val nonce = parts[2]
+            // Consume the nonce — rejects replayed state params even if signature is valid
+            if (!nonceStore.consume(nonce)) throw BadRequestException("OAuth state expired or already used — restart the login flow")
             val redirectUri = parts.getOrNull(3)?.takeIf { it.isNotBlank() }
             Triple(provider, appId, redirectUri)
         } catch (e: IllegalArgumentException) {
@@ -325,7 +337,31 @@ class AuthResource @Inject constructor(
             ?: throw BadRequestException("Unknown app: $appId")
         val allowed = app.allowedRedirectUris()
         if (allowed.isEmpty()) throw BadRequestException("App '$appId' has no redirect URIs registered")
-        if (redirectUri !in allowed) throw BadRequestException("redirect_uri is not registered for app '$appId'")
+        // Normalize both sides before comparing: lowercase scheme+host, strip trailing slash,
+        // strip default ports (443 for https, 80 for http) to prevent bypass via port variation.
+        val normalizedRequest = normalizeRedirectUri(uri)
+        if (allowed.none { runCatching { normalizeRedirectUri(URI.create(it)) }.getOrNull() == normalizedRequest }) {
+            throw BadRequestException("redirect_uri is not registered for app '$appId'")
+        }
+    }
+
+    /**
+     * Normalize a redirect URI for comparison:
+     * - Lowercase scheme and host
+     * - Strip default ports (443 for https, 80 for http)
+     * - Strip trailing slash from path
+     */
+    private fun normalizeRedirectUri(uri: URI): String {
+        val scheme = uri.scheme.lowercase()
+        val host = uri.host.lowercase()
+        val port = when {
+            uri.port == -1 -> ""
+            scheme == "https" && uri.port == 443 -> ""
+            scheme == "http" && uri.port == 80 -> ""
+            else -> ":${uri.port}"
+        }
+        val path = (uri.path ?: "").trimEnd('/')
+        return "$scheme://$host$port$path"
     }
 
     private fun UserService.UserView.toResponse() = UserResponse(
