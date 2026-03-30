@@ -34,6 +34,15 @@ class UserEntity {
     @Column(name = "email_verified", nullable = false)
     var emailVerified: Boolean = false
 
+    @Column(name = "mfa_enabled", nullable = false)
+    var mfaEnabled: Boolean = false
+
+    @Column(name = "mfa_secret")
+    var mfaSecret: String? = null
+
+    @Column(name = "mfa_backup_codes")
+    var mfaBackupCodes: String? = null
+
     @Column(name = "created_at", nullable = false)
     lateinit var createdAt: Instant
 

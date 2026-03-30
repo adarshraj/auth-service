@@ -25,6 +25,9 @@ class AuthTokenEntity {
     @Column(nullable = false)
     lateinit var type: String
 
+    @Column(name = "app_id")
+    var appId: String? = null
+
     @Column(name = "expires_at", nullable = false)
     lateinit var expiresAt: Instant
 
@@ -40,6 +43,22 @@ class AuthTokenRepository : PanacheRepositoryBase<AuthTokenEntity, String> {
 
     fun findByToken(token: String): AuthTokenEntity? =
         find("token", token).firstResult()
+
+    /**
+     * Atomically mark a token as used via UPDATE-before-SELECT.
+     * Eliminates the TOCTOU race where two concurrent requests could both
+     * consume the same one-time token before either commits.
+     * Returns the entity if successfully claimed, null otherwise.
+     */
+    fun claimToken(tokenHash: String, expectedType: String): AuthTokenEntity? {
+        val now = Instant.now().toString()
+        val updated = update(
+            "used = true WHERE token = ?1 AND type = ?2 AND used = false AND expiresAt > ?3",
+            tokenHash, expectedType, now
+        )
+        if (updated == 0) return null
+        return find("token", tokenHash).firstResult()
+    }
 
     /** Remove tokens older than 30 days to keep the table lean. */
     fun deleteExpiredBefore(cutoff: Instant): Long =

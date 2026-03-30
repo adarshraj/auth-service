@@ -2,6 +2,11 @@ package com.authservice.api
 
 import com.authservice.api.dto.AuthResponse
 import com.authservice.api.dto.LoginRequest
+import com.authservice.api.dto.MfaChallengeResponse
+import com.authservice.api.dto.MfaConfirmRequest
+import com.authservice.api.dto.MfaDisableRequest
+import com.authservice.api.dto.MfaSetupResponse
+import com.authservice.api.dto.MfaVerifyRequest
 import com.authservice.api.dto.RegisterRequest
 import com.authservice.api.dto.UserResponse
 import com.authservice.domain.AppRepository
@@ -10,10 +15,12 @@ import com.authservice.domain.OAuthCodeRepository
 import com.authservice.security.CallerContext
 import com.authservice.security.Hmac
 import com.authservice.security.JwtFilter
+import com.authservice.security.MfaNonceStore
 import com.authservice.security.OAuthNonceStore
 import com.authservice.security.RateLimiter
 import com.authservice.service.JwtService
 import com.authservice.service.OAuthService
+import com.authservice.service.TotpService
 import com.authservice.service.UserService
 import jakarta.inject.Inject
 import jakarta.transaction.Transactional
@@ -58,9 +65,12 @@ class AuthResource @Inject constructor(
     private val appRepository: AppRepository,
     private val oauthCodeRepository: OAuthCodeRepository,
     private val nonceStore: OAuthNonceStore,
+    private val mfaNonceStore: MfaNonceStore,
+    private val totpService: TotpService,
     // Purpose-specific secrets — each has its own env var to limit blast radius if one leaks
     @ConfigProperty(name = "auth.state-hmac-secret") private val stateHmacSecret: String,
     @ConfigProperty(name = "auth.token-pepper") private val tokenPepper: String,
+    @ConfigProperty(name = "auth.mfa-hmac-secret") private val mfaHmacSecret: String,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(AuthResource::class.java)
@@ -68,6 +78,10 @@ class AuthResource @Inject constructor(
         private const val CODE_TTL_SECONDS = 60L
         // Stricter per-account limit to defend against distributed brute force from multiple IPs
         private const val PER_ACCOUNT_RPM = 10
+        // MFA challenge tokens expire in 5 minutes
+        private const val MFA_TOKEN_TTL_SECONDS = 300L
+        // Per-userId rate limit for MFA verification — prevents brute force on 6-digit codes
+        private const val MFA_VERIFY_RPM = 5
     }
 
     // ── Register ──────────────────────────────────────────────────────────────
@@ -96,19 +110,134 @@ class AuthResource @Inject constructor(
 
     @POST
     @Path("/login")
-    @Operation(summary = "Login with email and password; returns a JWT")
+    @Operation(summary = "Login with email and password; returns a JWT or MFA challenge")
     fun login(
         @Valid body: LoginRequest,
         @HeaderParam("X-App-Id") appId: String?,
         @Context ctx: ContainerRequestContext,
-    ): AuthResponse {
+    ): Response {
         checkRateLimit(ctx)
         // Per-account limit: catches distributed brute force that rotates IPs to bypass per-IP limit
         checkRateLimit("auth:account:${body.email.lowercase().trim()}", PER_ACCOUNT_RPM)
         val user = userService.login(body.email, body.password, appId)
+
+        // If MFA is enabled, return a challenge instead of a JWT
+        if (userService.isMfaEnabled(user.id)) {
+            val mfaToken = buildMfaToken(user.id, user.email, appId)
+            return Response.ok(MfaChallengeResponse(mfaToken = mfaToken)).build()
+        }
+
         val role = appId?.let { userService.getRole(user.id, it) }
         val token = jwtService.sign(user.id, user.email, appId, role)
+        return Response.ok(AuthResponse(token, user.toResponse())).build()
+    }
+
+    // ── MFA challenge exchange (OAuth redirect flow) ──────────────────────────
+
+    @POST
+    @Path("/mfa/challenge")
+    @Consumes(MediaType.APPLICATION_FORM_URLENCODED)
+    @Operation(summary = "Exchange a one-time MFA code (from OAuth redirect) for an MFA challenge token")
+    fun mfaChallengeExchange(
+        @FormParam("code") @NotBlank code: String,
+        @Context ctx: ContainerRequestContext,
+    ): MfaChallengeResponse {
+        checkRateLimit(ctx)
+        // appId is bound to the token at creation time (in oauthCallback) — ignore client-supplied
+        // X-App-Id to prevent an attacker from minting tokens for arbitrary apps
+        val (userId, appId) = userService.consumeAuthToken(code, "mfa_challenge")
+        val user = userService.getById(userId)
+        val mfaToken = buildMfaToken(userId, user.email, appId)
+        return MfaChallengeResponse(mfaToken = mfaToken)
+    }
+
+    // ── MFA verify (complete login after MFA challenge) ──────────────────────
+
+    @POST
+    @Path("/mfa/verify")
+    @Operation(summary = "Complete login by verifying a TOTP code or backup code")
+    fun mfaVerify(
+        @Valid body: MfaVerifyRequest,
+        @Context ctx: ContainerRequestContext,
+    ): AuthResponse {
+        checkRateLimit(ctx)
+        val (userId, email, appId) = parseMfaToken(body.mfaToken)
+        // Per-userId rate limit — prevents distributed brute force on 6-digit codes
+        checkRateLimit("mfa:user:$userId", MFA_VERIFY_RPM)
+
+        val secret = userService.getMfaSecret(userId)
+            ?: throw BadRequestException("MFA not configured")
+
+        val codeValid = totpService.verify(secret, body.code) ||
+            userService.consumeBackupCode(userId, body.code)
+
+        if (!codeValid) {
+            log.infof("AUDIT mfa_verify_failed userId=%s", userId)
+            throw NotAuthorizedException("Invalid MFA code", "Bearer")
+        }
+
+        log.infof("AUDIT mfa_verify_success userId=%s", userId)
+        val role = appId?.let { userService.getRole(userId, it) }
+        val token = jwtService.sign(userId, email, appId, role)
+        val user = userService.getById(userId)
         return AuthResponse(token, user.toResponse())
+    }
+
+    // ── MFA setup (authenticated users only) ─────────────────────────────────
+
+    @POST
+    @Path("/mfa/setup")
+    @Operation(summary = "Start MFA enrollment — returns secret and QR URI")
+    fun mfaSetup(@Context ctx: ContainerRequestContext): MfaSetupResponse {
+        val caller = ctx.getProperty(JwtFilter.PROP_CALLER) as? CallerContext
+            ?: throw NotAuthorizedException("Authentication required", "Bearer")
+        val secret = totpService.generateSecret()
+        val recoveryCodes = totpService.generateRecoveryCodes()
+        userService.setupMfa(caller.userId, secret, recoveryCodes)
+        val uri = totpService.buildOtpAuthUri(secret, caller.email)
+        return MfaSetupResponse(secret = secret, otpauthUri = uri, recoveryCodes = recoveryCodes)
+    }
+
+    @POST
+    @Path("/mfa/confirm")
+    @Operation(summary = "Confirm MFA enrollment by verifying a TOTP code")
+    fun mfaConfirm(
+        @Valid body: MfaConfirmRequest,
+        @Context ctx: ContainerRequestContext,
+    ): Response {
+        val caller = ctx.getProperty(JwtFilter.PROP_CALLER) as? CallerContext
+            ?: throw NotAuthorizedException("Authentication required", "Bearer")
+        checkRateLimit("mfa:user:${caller.userId}", MFA_VERIFY_RPM)
+        val secret = userService.getMfaSecret(caller.userId)
+            ?: throw BadRequestException("MFA setup not started")
+        if (!totpService.verify(secret, body.code)) {
+            throw BadRequestException("Invalid TOTP code — check your authenticator app and try again")
+        }
+        userService.confirmMfa(caller.userId)
+        return Response.ok(mapOf("message" to "MFA enabled")).build()
+    }
+
+    @POST
+    @Path("/mfa/disable")
+    @Operation(summary = "Disable MFA (requires a valid TOTP or backup code)")
+    fun mfaDisable(
+        @Valid body: MfaDisableRequest,
+        @Context ctx: ContainerRequestContext,
+    ): Response {
+        val caller = ctx.getProperty(JwtFilter.PROP_CALLER) as? CallerContext
+            ?: throw NotAuthorizedException("Authentication required", "Bearer")
+        val secret = userService.getMfaSecret(caller.userId)
+            ?: throw BadRequestException("MFA is not configured for this account")
+        if (!userService.isMfaEnabled(caller.userId)) {
+            throw BadRequestException("MFA is not enabled")
+        }
+        val codeValid = totpService.verify(secret, body.code) ||
+            userService.consumeBackupCode(caller.userId, body.code)
+        if (!codeValid) {
+            throw BadRequestException("Invalid code")
+        }
+        userService.disableMfa(caller.userId)
+        return Response.ok(mapOf("message" to "MFA disabled")).build()
     }
 
     // ── Logout ────────────────────────────────────────────────────────────────
@@ -199,6 +328,24 @@ class AuthResource @Inject constructor(
             emailVerified = oauthUser.emailVerified,
         )
 
+        // If user has MFA enabled, require a second factor before issuing a JWT
+        if (userService.isMfaEnabled(user.id)) {
+            return if (redirectUri != null) {
+                // Issue an opaque single-use code that the client exchanges for the mfaToken
+                // via POST /auth/mfa/challenge. This avoids exposing the mfaToken in the URL
+                // (browser history, Referer headers, proxy logs).
+                val mfaCode = userService.createAuthToken(user.id, "mfa_challenge", expiresInHours = 0, expiresInSeconds = CODE_TTL_SECONDS, appId = appId)
+                val location = UriBuilder.fromUri(redirectUri)
+                    .queryParam("mfa_required", "true")
+                    .queryParam("mfa_code", mfaCode)
+                    .build()
+                Response.temporaryRedirect(location).build()
+            } else {
+                val mfaToken = buildMfaToken(user.id, user.email, appId)
+                Response.ok(MfaChallengeResponse(mfaToken = mfaToken)).build()
+            }
+        }
+
         return if (redirectUri != null) {
             val authCode = issueOAuthCode(user.id, user.email, appId)
             // UriBuilder handles existing query params (appends & when needed) and percent-encodes values
@@ -221,7 +368,7 @@ class AuthResource @Inject constructor(
     fun exchangeToken(
         @FormParam("code") @NotBlank code: String,
         @Context ctx: ContainerRequestContext,
-    ): AuthResponse {
+    ): Response {
         checkRateLimit(ctx)
         // claimCode atomically marks the code used via UPDATE-before-SELECT,
         // eliminating the TOCTOU race where two concurrent requests could both
@@ -231,13 +378,58 @@ class AuthResource @Inject constructor(
         val user = try { userService.getById(entity.userId) }
             catch (e: jakarta.ws.rs.NotFoundException) { throw BadRequestException("Invalid auth code") }
 
+        // If MFA is enabled, return a challenge instead of a JWT
+        if (userService.isMfaEnabled(entity.userId)) {
+            val mfaToken = buildMfaToken(entity.userId, entity.email, entity.appId)
+            return Response.ok(MfaChallengeResponse(mfaToken = mfaToken)).build()
+        }
+
         val role = entity.appId?.let { userService.getRole(entity.userId, it) }
         val token = jwtService.sign(entity.userId, entity.email, entity.appId, role)
         log.infof("AUDIT token_exchanged userId=%s app=%s", entity.userId, entity.appId ?: "none")
-        return AuthResponse(token, user.toResponse())
+        return Response.ok(AuthResponse(token, user.toResponse())).build()
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Build a short-lived, single-use HMAC-signed MFA challenge token.
+     * Format: base64url(userId\nemail\nappId\nnonce\nexpiry)~hmac
+     * Uses auth.mfa-hmac-secret (separate from OAuth state and token pepper).
+     * The nonce is registered in MfaNonceStore so the token can only be used once.
+     */
+    private fun buildMfaToken(userId: String, email: String, appId: String?): String {
+        val nonce = ByteArray(16).also { secureRandom.nextBytes(it) }
+            .joinToString("") { "%02x".format(it) }
+        mfaNonceStore.register(nonce)
+        val expiry = (System.currentTimeMillis() / 1000) + MFA_TOKEN_TTL_SECONDS
+        val parts = listOf(userId, email, appId ?: "", nonce, expiry.toString())
+        val payload = java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(parts.joinToString("\n").toByteArray())
+        val sig = Hmac.sha256(payload, mfaHmacSecret)
+        return "$payload~$sig"
+    }
+
+    /** Parse, verify, and consume an MFA challenge token (single-use). Returns (userId, email, appId?). */
+    private fun parseMfaToken(token: String): Triple<String, String, String?> {
+        val tildeIdx = token.lastIndexOf('~')
+        if (tildeIdx < 0) throw BadRequestException("Invalid MFA token")
+        val payload = token.substring(0, tildeIdx)
+        val sig = token.substring(tildeIdx + 1)
+        if (!Hmac.verify(payload, sig, mfaHmacSecret)) throw BadRequestException("Invalid MFA token")
+        return try {
+            val decoded = String(java.util.Base64.getUrlDecoder().decode(payload))
+            val parts = decoded.split("\n")
+            if (parts.size < 5) throw BadRequestException("Invalid MFA token")
+            val nonce = parts[3]
+            if (!mfaNonceStore.consume(nonce)) throw BadRequestException("MFA token already used or expired — please login again")
+            val expiry = parts[4].toLongOrNull() ?: throw BadRequestException("Invalid MFA token")
+            if (System.currentTimeMillis() / 1000 > expiry) throw BadRequestException("MFA token expired — please login again")
+            Triple(parts[0], parts[1], parts[2].takeIf { it.isNotBlank() })
+        } catch (e: IllegalArgumentException) {
+            throw BadRequestException("Invalid MFA token")
+        }
+    }
 
     private fun issueOAuthCode(userId: String, email: String, appId: String?): String {
         val rawCode = ByteArray(32).also { secureRandom.nextBytes(it) }

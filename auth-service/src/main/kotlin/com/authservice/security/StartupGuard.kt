@@ -15,6 +15,7 @@ class StartupGuard @Inject constructor(
     @ConfigProperty(name = "auth.key-hmac-secret") private val hmacSecret: String,
     @ConfigProperty(name = "auth.state-hmac-secret") private val stateHmacSecret: String,
     @ConfigProperty(name = "auth.token-pepper") private val tokenPepper: String,
+    @ConfigProperty(name = "auth.mfa-hmac-secret") private val mfaHmacSecret: String,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(StartupGuard::class.java)
@@ -22,6 +23,7 @@ class StartupGuard @Inject constructor(
             "dev-only-insecure-hmac-secret-change-in-prod",
             "dev-only-insecure-state-secret-change-in-prod",
             "dev-only-insecure-token-pepper-change-in-prod",
+            "dev-only-insecure-mfa-secret-change-in-prod",
         )
     }
 
@@ -29,6 +31,7 @@ class StartupGuard @Inject constructor(
         checkSecret("auth.key-hmac-secret / AUTH_KEY_HMAC_SECRET", hmacSecret)
         checkSecret("auth.state-hmac-secret / AUTH_STATE_HMAC_SECRET", stateHmacSecret)
         checkSecret("auth.token-pepper / AUTH_TOKEN_PEPPER", tokenPepper)
+        checkSecret("auth.mfa-hmac-secret / AUTH_MFA_HMAC_SECRET", mfaHmacSecret)
         checkAdminKey()
     }
 

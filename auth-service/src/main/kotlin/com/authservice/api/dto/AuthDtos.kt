@@ -33,3 +33,28 @@ data class AuthResponse(
     val token: String,
     val user: UserResponse,
 )
+
+/** Returned instead of AuthResponse when the user has MFA enabled. */
+data class MfaChallengeResponse(
+    val mfaRequired: Boolean = true,
+    val mfaToken: String,
+)
+
+data class MfaVerifyRequest(
+    @field:NotBlank val mfaToken: String = "",
+    @field:NotBlank val code: String = "",
+)
+
+data class MfaSetupResponse(
+    val secret: String,
+    val otpauthUri: String,
+    val recoveryCodes: List<String>,
+)
+
+data class MfaConfirmRequest(
+    @field:NotBlank val code: String = "",
+)
+
+data class MfaDisableRequest(
+    @field:NotBlank val code: String = "",
+)

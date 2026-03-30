@@ -29,7 +29,7 @@ class JwtFilter @Inject constructor(
         const val PROP_CALLER = "auth.caller"
 
         // Paths that require a valid JWT
-        private val PROTECTED = setOf("/auth/me", "/auth/account")
+        private val PROTECTED = setOf("/auth/me", "/auth/account", "/auth/mfa/setup", "/auth/mfa/confirm", "/auth/mfa/disable")
     }
 
     override fun filter(ctx: ContainerRequestContext) {

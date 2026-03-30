@@ -20,9 +20,13 @@ import jakarta.ws.rs.WebApplicationException
 import jakarta.ws.rs.core.Response
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.jboss.logging.Logger
+import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 @ApplicationScoped
 class UserService @Inject constructor(
@@ -204,15 +208,21 @@ class UserService @Inject constructor(
     // ── Auth tokens (password reset / magic link / email verification) ─────────
 
     @Transactional
-    fun createAuthToken(userId: String, type: String, expiresInHours: Long): String {
+    fun createAuthToken(userId: String, type: String, expiresInHours: Long = 0, expiresInSeconds: Long = 0, appId: String? = null): String {
         val rawToken = generateToken()
+        val expiry = if (expiresInSeconds > 0) {
+            Instant.now().plus(expiresInSeconds, ChronoUnit.SECONDS)
+        } else {
+            Instant.now().plus(expiresInHours, ChronoUnit.HOURS)
+        }
         // Store only the HMAC of the token — a DB dump does not expose active secrets
         val entity = AuthTokenEntity().apply {
             id = generateId()
             this.userId = userId
             this.token = Hmac.sha256(rawToken, tokenPepper)
             this.type = type
-            this.expiresAt = Instant.now().plus(expiresInHours, ChronoUnit.HOURS)
+            this.appId = appId
+            this.expiresAt = expiry
             this.used = false
             this.createdAt = Instant.now()
         }
@@ -220,15 +230,71 @@ class UserService @Inject constructor(
         return rawToken
     }
 
+    /**
+     * Atomically consume a single-use auth token.
+     * Uses UPDATE-before-SELECT to eliminate TOCTOU races (same pattern as OAuthCodeRepository.claimCode).
+     * Returns (userId, appId).
+     */
     @Transactional
-    fun consumeAuthToken(rawToken: String, expectedType: String): String {
-        val entity = authTokenRepository.findByToken(Hmac.sha256(rawToken, tokenPepper))
-            ?: throw BadRequestException("Invalid token")
-        if (entity.used) throw BadRequestException("Token already used")
-        if (entity.type != expectedType) throw BadRequestException("Invalid token type")
-        if (entity.expiresAt.isBefore(Instant.now())) throw BadRequestException("Token expired")
-        entity.used = true
-        return entity.userId
+    fun consumeAuthToken(rawToken: String, expectedType: String): Pair<String, String?> {
+        val entity = authTokenRepository.claimToken(Hmac.sha256(rawToken, tokenPepper), expectedType)
+            ?: throw BadRequestException("Invalid or expired token")
+        return Pair(entity.userId, entity.appId)
+    }
+
+    // ── MFA ──────────────────────────────────────────────────────────────────
+
+    fun isMfaEnabled(userId: String): Boolean =
+        (userRepository.findById(userId) ?: throw NotFoundException("User not found")).mfaEnabled
+
+    @Transactional
+    fun setupMfa(userId: String, secret: String, backupCodes: List<String>) {
+        val user = userRepository.findById(userId) ?: throw NotFoundException("User not found")
+        if (user.mfaEnabled) throw BadRequestException("MFA is already enabled")
+        // Encrypt the TOTP secret so a DB dump does not expose second-factor material.
+        // Backup codes are stored as HMAC hashes — same pattern as auth tokens.
+        user.mfaSecret = encryptMfaSecret(secret)
+        user.mfaBackupCodes = backupCodes.joinToString(",") { Hmac.sha256(it, tokenPepper) }
+        user.updatedAt = Instant.now()
+    }
+
+    @Transactional
+    fun confirmMfa(userId: String) {
+        val user = userRepository.findById(userId) ?: throw NotFoundException("User not found")
+        if (user.mfaSecret == null) throw BadRequestException("MFA setup not started")
+        if (user.mfaEnabled) throw BadRequestException("MFA is already enabled")
+        user.mfaEnabled = true
+        user.updatedAt = Instant.now()
+        log.infof("AUDIT mfa_enabled userId=%s", userId)
+    }
+
+    @Transactional
+    fun disableMfa(userId: String) {
+        val user = userRepository.findById(userId) ?: throw NotFoundException("User not found")
+        if (!user.mfaEnabled) throw BadRequestException("MFA is not enabled")
+        user.mfaEnabled = false
+        user.mfaSecret = null
+        user.mfaBackupCodes = null
+        user.updatedAt = Instant.now()
+        log.infof("AUDIT mfa_disabled userId=%s", userId)
+    }
+
+    fun getMfaSecret(userId: String): String? {
+        val encrypted = (userRepository.findById(userId) ?: throw NotFoundException("User not found")).mfaSecret
+            ?: return null
+        return decryptMfaSecret(encrypted)
+    }
+
+    @Transactional
+    fun consumeBackupCode(userId: String, code: String): Boolean {
+        val user = userRepository.findById(userId) ?: throw NotFoundException("User not found")
+        val hashes = user.mfaBackupCodes?.split(",")?.toMutableList() ?: return false
+        val codeHash = Hmac.sha256(code.lowercase().trim(), tokenPepper)
+        if (!hashes.remove(codeHash)) return false
+        user.mfaBackupCodes = hashes.joinToString(",")
+        user.updatedAt = Instant.now()
+        log.infof("AUDIT mfa_backup_code_used userId=%s", userId)
+        return true
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
@@ -251,6 +317,32 @@ class UserService @Inject constructor(
             this.grantedAt = Instant.now()
         }
         accessRepository.persist(access)
+    }
+
+    /** AES-256-GCM encrypt using first 32 bytes of SHA-256(tokenPepper) as key. */
+    private fun encryptMfaSecret(plaintext: String): String {
+        val keyBytes = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(tokenPepper.toByteArray(StandardCharsets.UTF_8))
+        val iv = ByteArray(12).also { secureRandom.nextBytes(it) }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+        val ciphertext = cipher.doFinal(plaintext.toByteArray(StandardCharsets.UTF_8))
+        // Store as iv:ciphertext in base64
+        val ivB64 = java.util.Base64.getEncoder().encodeToString(iv)
+        val ctB64 = java.util.Base64.getEncoder().encodeToString(ciphertext)
+        return "$ivB64:$ctB64"
+    }
+
+    private fun decryptMfaSecret(encrypted: String): String {
+        val keyBytes = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(tokenPepper.toByteArray(StandardCharsets.UTF_8))
+        val parts = encrypted.split(":")
+        if (parts.size != 2) throw BadRequestException("Corrupted MFA secret")
+        val iv = java.util.Base64.getDecoder().decode(parts[0])
+        val ciphertext = java.util.Base64.getDecoder().decode(parts[1])
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+        return String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8)
     }
 
     private fun generateId(): String {
