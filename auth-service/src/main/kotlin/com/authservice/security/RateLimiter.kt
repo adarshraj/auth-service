@@ -36,6 +36,9 @@ class RateLimiter @Inject constructor(
         return window.count.incrementAndGet() <= maxRequests
     }
 
+    /** Clear all buckets — intended for test teardown only. */
+    fun resetAll() = windows.clear()
+
     @Scheduled(every = "2m")
     fun evictStaleWindows() {
         val cutoff = System.currentTimeMillis() - windowMs * 2

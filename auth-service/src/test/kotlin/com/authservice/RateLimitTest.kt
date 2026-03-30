@@ -4,6 +4,7 @@ import com.authservice.domain.AppRepository
 import com.authservice.domain.AuthTokenRepository
 import com.authservice.domain.UserAppAccessRepository
 import com.authservice.domain.UserRepository
+import com.authservice.security.RateLimiter
 import io.quarkus.test.junit.QuarkusTest
 import io.quarkus.test.junit.QuarkusTestProfile
 import io.quarkus.test.junit.TestProfile
@@ -34,6 +35,7 @@ class RateLimitTest {
     @Inject lateinit var appRepository: AppRepository
     @Inject lateinit var accessRepository: UserAppAccessRepository
     @Inject lateinit var authTokenRepository: AuthTokenRepository
+    @Inject lateinit var rateLimiter: RateLimiter
 
     @BeforeEach
     @Transactional
@@ -42,6 +44,7 @@ class RateLimitTest {
         accessRepository.deleteAll()
         userRepository.deleteAll()
         appRepository.deleteAll()
+        rateLimiter.resetAll()
     }
 
     @Test

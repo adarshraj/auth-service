@@ -111,6 +111,7 @@ class AuthResource @Inject constructor(
 
     @POST
     @Path("/logout")
+    @Consumes(MediaType.WILDCARD)
     @Operation(summary = "Logout (stateless — client drops the token)")
     fun logout(): Response =
         Response.ok(mapOf("message" to "Logged out")).build()
