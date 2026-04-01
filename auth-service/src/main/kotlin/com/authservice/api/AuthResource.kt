@@ -7,6 +7,7 @@ import com.authservice.api.dto.UserResponse
 import com.authservice.domain.AppRepository
 import com.authservice.domain.OAuthCodeEntity
 import com.authservice.domain.OAuthCodeRepository
+import com.authservice.domain.RefreshTokenRepository
 import com.authservice.security.CallerContext
 import com.authservice.security.Hmac
 import com.authservice.security.JwtFilter
@@ -57,6 +58,7 @@ class AuthResource @Inject constructor(
     private val rateLimiter: RateLimiter,
     private val appRepository: AppRepository,
     private val oauthCodeRepository: OAuthCodeRepository,
+    private val refreshTokenRepository: RefreshTokenRepository,
     private val nonceStore: OAuthNonceStore,
     // Purpose-specific secrets — each has its own env var to limit blast radius if one leaks
     @ConfigProperty(name = "auth.state-hmac-secret") private val stateHmacSecret: String,
@@ -120,9 +122,16 @@ class AuthResource @Inject constructor(
     @POST
     @Path("/logout")
     @Consumes(MediaType.WILDCARD)
-    @Operation(summary = "Logout (stateless — client drops the token)")
-    fun logout(): Response =
-        Response.ok(mapOf("message" to "Logged out")).build()
+    @Transactional
+    @Operation(summary = "Logout — clears session cookie and optionally revokes a refresh token")
+    fun logout(@QueryParam("refresh_token") refreshToken: String?): Response {
+        if (!refreshToken.isNullOrBlank()) {
+            // Revoke the refresh token so it cannot be used to obtain new access tokens
+            val tokenHash = Hmac.sha256(refreshToken, tokenPepper)
+            refreshTokenRepository.claimToken(tokenHash) // returns null if already revoked/expired — no error
+        }
+        return Response.ok(mapOf("message" to "Logged out")).build()
+    }
 
     // ── Refresh ───────────────────────────────────────────────────────────────
 

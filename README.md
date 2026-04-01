@@ -22,7 +22,7 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 |--------|------|-------------|
 | `POST` | `/auth/register` | Register (email + password); `X-App-Id` header optional |
 | `POST` | `/auth/login` | Login → JWT; `X-App-Id` header optional |
-| `POST` | `/auth/logout` | Stateless — client drops the token |
+| `POST` | `/auth/logout` | Clears session cookie; optional `?refresh_token=` to revoke it |
 | `GET`  | `/auth/me` | Current user (requires `Authorization: Bearer <token>`) |
 | `DELETE` | `/auth/account` | Delete own account (requires JWT) |
 | `GET`  | `/auth/oauth/{provider}` | Redirect to Google or GitHub; optional `?redirect_uri=` and `X-App-Id` |
@@ -269,7 +269,7 @@ ES256 provides stronger security with significantly less CPU cost at signing tim
 - **SQLite key material** — the EC private key and user data live in the DB file. Protect it with filesystem permissions, encrypted volumes, and off-site backups.
 - **TLS, HSTS, CORS** — terminate TLS at the reverse proxy; set `AUTH_CORS_ORIGINS` explicitly in prod (default is empty — not `*`). HSTS is set at the application level via `SecurityHeadersFilter` (max-age=1 year, includeSubDomains).
 - **Dependency CVEs** — no automated scanner is configured in-repo. Consider adding Dependabot or OSV-Scanner to the CI pipeline.
-- **Stateless logout** — `POST /auth/logout` clears the `platform_session` cookie but does not revoke refresh tokens or invalidate access JWTs. Access tokens expire in 15 minutes. On compromise: rotate `AUTH_TOKEN_PEPPER` (invalidates refresh tokens) and wipe `ec_keys` table (invalidates all JWTs; new key pair generated on next boot).
+- **Logout** — `POST /auth/logout?refresh_token=<token>` clears the session cookie and revokes the refresh token. The `refresh_token` param is optional for backward compatibility. Access tokens remain valid until their 15-minute expiry (stateless). On compromise: rotate `AUTH_TOKEN_PEPPER` (invalidates all refresh tokens) and wipe `ec_keys` table (invalidates all JWTs; new key pair generated on next boot).
 - **Single-instance rate limiter and nonce store** — in-memory; not shared across instances. Use sticky sessions or Redis if scaling horizontally.
 - **JWT contains PII** — `email` is in the payload. Consuming services should avoid logging raw tokens.
 - **Health/metrics endpoints** (`/q/health`, `/q/metrics`) — ensure your reverse proxy does not expose these publicly if needed.

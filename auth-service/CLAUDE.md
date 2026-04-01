@@ -395,8 +395,8 @@ Tokens issued without `X-App-Id` have no `groups` claim. Tokens with `X-App-Id` 
 #### Single-instance constraints
 - **`OAuthNonceStore`** and **`RateLimiter`** are in-memory. With multiple instances, OAuth nonces are not shared (callbacks may fail if they hit a different instance than the redirect), and effective rate limits multiply by instance count. Use sticky sessions or a shared store (Redis) if scaling horizontally.
 
-#### Stateless logout and incident response
-- `POST /auth/logout` clears the `platform_session` cookie but does not revoke refresh tokens or block existing access JWTs. Access tokens remain valid until their 15-minute expiry.
+#### Logout and incident response
+- `POST /auth/logout?refresh_token=<token>` clears the `platform_session` cookie and revokes the provided refresh token. The `refresh_token` query param is optional for backward compatibility — if omitted, only the cookie is cleared. Access tokens remain valid until their 15-minute expiry (stateless).
 - **Incident response playbook:** On compromise, rotate `AUTH_TOKEN_PEPPER` (invalidates all refresh tokens at rest) and wipe the `ec_keys` table (invalidates all access JWTs immediately since a new signing key is generated on next boot). The short access token TTL limits the window of exposure.
 
 #### HSTS over HTTP

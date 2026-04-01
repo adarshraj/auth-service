@@ -2,6 +2,7 @@ package com.authservice.service
 
 import at.favre.lib.crypto.bcrypt.BCrypt
 import jakarta.enterprise.context.ApplicationScoped
+import org.jboss.logging.Logger
 
 /**
  * bcrypt hash/verify.
@@ -12,16 +13,33 @@ import jakarta.enterprise.context.ApplicationScoped
 @ApplicationScoped
 class PasswordService {
 
+    companion object {
+        private val log: Logger = Logger.getLogger(PasswordService::class.java)
+    }
+
     private val hasher = BCrypt.withDefaults()
     private val verifier = BCrypt.verifyer()
 
     /** Common passwords that are rejected regardless of length. Loaded once at startup. */
-    private val commonPasswords: Set<String> = javaClass.getResourceAsStream("/common-passwords.txt")
-        ?.bufferedReader()?.readLines()
-        ?.map { it.trim().lowercase() }
-        ?.filter { it.isNotBlank() }
-        ?.toSet()
-        ?: emptySet()
+    private val commonPasswords: Set<String> = loadCommonPasswords()
+
+    private fun loadCommonPasswords(): Set<String> {
+        val stream = javaClass.getResourceAsStream("/common-passwords.txt")
+        if (stream == null) {
+            log.warn("common-passwords.txt not found on classpath — common password rejection is disabled")
+            return emptySet()
+        }
+        val passwords = stream.bufferedReader().readLines()
+            .map { it.trim().lowercase() }
+            .filter { it.isNotBlank() }
+            .toSet()
+        if (passwords.isEmpty()) {
+            log.warn("common-passwords.txt is empty — common password rejection is disabled")
+        } else {
+            log.infof("Loaded %d common passwords for rejection", passwords.size)
+        }
+        return passwords
+    }
 
     fun hash(password: String): String =
         hasher.hashToString(12, password.toCharArray())
