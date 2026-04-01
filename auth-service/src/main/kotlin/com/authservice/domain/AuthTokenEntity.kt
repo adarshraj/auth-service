@@ -25,6 +25,9 @@ class AuthTokenEntity {
     @Column(nullable = false)
     lateinit var type: String
 
+    @Column(name = "app_id")
+    var appId: String? = null
+
     @Column(name = "expires_at", nullable = false)
     lateinit var expiresAt: Instant
 

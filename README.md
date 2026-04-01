@@ -13,6 +13,7 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 - Public JWKS endpoint — consuming services verify tokens using the public key, no shared secret needed
 - `aud` claim scoped to `appId` — a token issued for one app is rejected by any other app
 - `groups` claim with the user's app-level role — consuming Quarkus/MP-JWT services can use `@RolesAllowed` directly
+- Optional TOTP-based MFA — users opt-in; existing clients unaffected. Built with JDK crypto only (no external dependencies)
 
 ## API
 
@@ -30,6 +31,11 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 | `POST` | `/auth/token` | Exchange one-time code for a JWT (`application/x-www-form-urlencoded`, field: `code`) |
 | `POST` | `/auth/refresh` | Exchange a refresh token for a new access + refresh token (`application/x-www-form-urlencoded`, field: `refresh_token`) |
 | `GET`  | `/auth/verify` | Forward auth — returns 200 (with user identity headers) or 401; accepts `platform_session` cookie or `Authorization: Bearer` |
+| `POST` | `/auth/mfa/setup` | Start MFA enrollment — returns TOTP secret, QR URI, recovery codes (requires JWT) |
+| `POST` | `/auth/mfa/confirm` | Confirm MFA enrollment with a valid TOTP code (requires JWT) |
+| `POST` | `/auth/mfa/verify` | Complete login with TOTP code or backup code (requires MFA token from login) |
+| `POST` | `/auth/mfa/challenge` | Exchange a one-time MFA code (from OAuth redirect) for an MFA challenge token (`application/x-www-form-urlencoded`, field: `code`) |
+| `POST` | `/auth/mfa/disable` | Disable MFA — requires valid TOTP or backup code (requires JWT) |
 | `GET`  | `/.well-known/jwks.json` | Public key in JWK Set format for ES256 token verification |
 
 ### App management (admin — requires `X-Admin-Key`)
@@ -42,6 +48,52 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 | `GET`  | `/auth/apps/{appId}/access` | List users with explicit access |
 | `POST` | `/auth/apps/{appId}/access/{userId}` | Grant access |
 | `DELETE` | `/auth/apps/{appId}/access/{userId}` | Revoke access |
+
+## MFA (two-factor authentication)
+
+MFA is optional. Users who don't enable it see no changes to the login flow.
+
+### Enabling MFA
+
+1. Authenticate and call `POST /auth/mfa/setup` with your JWT. Response:
+   ```json
+   {
+     "secret": "JBSWY3DPEHPK3PXP...",
+     "otpauthUri": "otpauth://totp/AuthService:user@example.com?secret=...",
+     "recoveryCodes": ["abc12345", "def67890", ...]
+   }
+   ```
+2. Scan the `otpauthUri` as a QR code in any authenticator app (Google Authenticator, Authy, etc.).
+3. Save the `recoveryCodes` — these are single-use backup codes in case you lose your authenticator.
+4. Confirm by calling `POST /auth/mfa/confirm` with a valid 6-digit TOTP code from the app:
+   ```json
+   { "code": "123456" }
+   ```
+
+### Logging in with MFA
+
+MFA is enforced across all login paths — password login, OAuth (JSON and redirect flows), and code exchange.
+
+1. `POST /auth/login` (or OAuth callback / `POST /auth/token`). When MFA is enabled, the response changes:
+   ```json
+   { "mfaRequired": true, "mfaToken": "..." }
+   ```
+   For the OAuth redirect flow, the redirect URL becomes `?mfa_required=true&mfa_token=...` instead of `?code=...`.
+2. Prompt the user for their 6-digit TOTP code (or a backup code), then call:
+   ```
+   POST /auth/mfa/verify
+   { "mfaToken": "...", "code": "123456" }
+   ```
+3. Response is the standard `{ token, user }`.
+
+The `mfaToken` is valid for **5 minutes** and **single-use**. If it expires or is reused, the user must log in again.
+
+### Disabling MFA
+
+Call `POST /auth/mfa/disable` with a valid TOTP or backup code:
+```json
+{ "code": "123456" }
+```
 
 ## OAuth browser flow
 
@@ -60,7 +112,16 @@ When a client app wants to log a user in via OAuth and receive a JWT:
 
 The JWT is never placed in a URL or fragment — it only travels over the back-channel exchange.
 
-**`redirect_uri` must be registered** for the app via `POST /auth/apps` (`redirectUris` field) before the flow will work.
+**`redirect_uri` must be registered** for the app via `POST /auth/apps` (`redirectUris` field) before the flow will work. Redirect URIs are compared by `scheme://host:port/path` only — query strings and fragments are ignored during validation.
+
+**If the user has MFA enabled**, step 2 redirects to `https://yourapp.com/callback?mfa_required=true&mfa_code=<code>` instead. Your server exchanges the code for an MFA challenge token, then completes the TOTP step:
+```
+POST /auth/mfa/challenge
+Content-Type: application/x-www-form-urlencoded
+
+code=<mfa-code>
+```
+Response is `{ mfaRequired, mfaToken }`. Then complete MFA via `POST /auth/mfa/verify`.
 
 ## Token refresh
 
@@ -125,6 +186,19 @@ No shared secret is needed. If the key pair is rotated, the `kid` field changes 
 
 > **Tokens without `aud`:** Tokens issued without `X-App-Id` have no `aud` claim and are broadly usable. Always pass `X-App-Id` in login/register/OAuth flows to scope tokens to your app.
 
+### Polymorphic responses (MFA)
+
+`POST /auth/login`, `POST /auth/token`, and `GET /auth/oauth/callback` (JSON mode) return either `AuthResponse` or `MfaChallengeResponse` depending on whether the user has MFA enabled. Both are HTTP 200. Clients should check for the `mfaRequired` field:
+
+```
+// Pseudocode
+response = POST /auth/login { email, password }
+if response.mfaRequired:
+    mfaCode = promptUser("Enter TOTP code")
+    response = POST /auth/mfa/verify { mfaToken: response.mfaToken, code: mfaCode }
+jwt = response.token
+```
+
 ## Running locally
 
 ```bash
@@ -133,7 +207,7 @@ cd auth-service
 # Starts on http://localhost:8703
 ```
 
-No env vars are required for local dev — all secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`) have insecure dev defaults that are accepted in the `dev` profile (a warning is logged but startup is not blocked). Set `AUTH_ADMIN_KEY` only if you need the app management endpoints.
+No env vars are required for local dev — all secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`, `AUTH_MFA_HMAC_SECRET`) have insecure dev defaults that are accepted in the `dev` profile (a warning is logged but startup is not blocked). Set `AUTH_ADMIN_KEY` only if you need the app management endpoints.
 
 SQLite is used by default — no database setup needed. The EC key pair is generated on first boot and persisted to the DB.
 
@@ -141,7 +215,7 @@ SQLite is used by default — no database setup needed. The EC key pair is gener
 
 All commands below run from the `auth-service/` directory (where `pom.xml` lives).
 
-**Profile:** A packaged run uses Quarkus's **`prod`** profile. On startup, the service refuses to boot unless all three HMAC secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`) are set to non-default values. Set `AUTH_ADMIN_KEY` if you need the `/auth/apps` admin API.
+**Profile:** A packaged run uses Quarkus's **`prod`** profile. On startup, the service refuses to boot unless all four HMAC secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`, `AUTH_MFA_HMAC_SECRET`) are set to non-default values. Set `AUTH_ADMIN_KEY` if you need the `/auth/apps` admin API.
 
 **EC key pair:** Generated automatically on first boot and stored in the database. Mount a persistent volume for the DB file so the key survives container restarts.
 
@@ -196,7 +270,8 @@ On first register/OAuth-login into a `requiresExplicitAccess: true` app, access 
 | `AUTH_ADMIN_KEY` | For app mgmt | Key for `/auth/apps` endpoints |
 | `AUTH_KEY_HMAC_SECRET` | Prod | HMAC secret for hashing the admin key; min 32 chars |
 | `AUTH_STATE_HMAC_SECRET` | Prod | HMAC secret for signing OAuth state params (prevents open redirect / CSRF) |
-| `AUTH_TOKEN_PEPPER` | Prod | HMAC pepper for storing auth tokens and OAuth codes at rest |
+| `AUTH_TOKEN_PEPPER` | Prod | HMAC pepper for storing auth tokens, OAuth codes, and MFA backup codes at rest; also AES key seed for MFA secret encryption |
+| `AUTH_MFA_HMAC_SECRET` | Prod | HMAC secret for signing MFA challenge tokens (min 32 chars) |
 | `AUTH_BASE_URL` | For OAuth | Base URL for OAuth callback redirect (e.g. `https://auth.example.com`) |
 | `AUTH_JWT_EXPIRY_SECONDS` | No | Access token TTL in seconds (default: 900 = 15 minutes) |
 | `AUTH_REFRESH_TOKEN_EXPIRY_SECONDS` | No | Refresh token TTL in seconds (default: 604800 = 7 days) |
@@ -257,7 +332,8 @@ ES256 provides stronger security with significantly less CPU cost at signing tim
 | Security headers | `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `CSP: default-src 'none'`, `HSTS: max-age=31536000`, `Referrer-Policy: strict-origin-when-cross-origin` on all responses |
 | Login error messages | Generic "Invalid email or password" for all failures — does not reveal whether email is registered or OAuth-only |
 | Deleted-user guard | `POST /auth/token` rejects a valid code if the account was deleted after code issuance |
-| Audit logging | Critical events (login success/failure, account deletion, token exchange, admin auth failures) logged at INFO with an `AUDIT` prefix |
+| MFA / TOTP | Optional per-user TOTP (RFC 6238) using JDK crypto only. Enforced across all login paths (password + OAuth). TOTP secret encrypted with AES-256-GCM at rest; backup codes stored as HMAC hashes. Single-use MFA challenge token (dedicated HMAC secret, nonce-based). Per-userId rate limit (5 RPM) on MFA verification |
+| Audit logging | Critical events (login success/failure, account deletion, token exchange, admin auth failures, MFA enable/disable/verify) logged at INFO with an `AUDIT` prefix |
 
 ### By-design / operational notes
 

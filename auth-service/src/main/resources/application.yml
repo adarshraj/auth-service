@@ -44,6 +44,7 @@ auth:
   key-hmac-secret: ${AUTH_KEY_HMAC_SECRET:dev-only-insecure-hmac-secret-change-in-prod}
   state-hmac-secret: ${AUTH_STATE_HMAC_SECRET:dev-only-insecure-state-secret-change-in-prod}
   token-pepper: ${AUTH_TOKEN_PEPPER:dev-only-insecure-token-pepper-change-in-prod}
+  mfa-hmac-secret: ${AUTH_MFA_HMAC_SECRET:dev-only-insecure-mfa-secret-change-in-prod}
   rate-limit:
     enabled: ${AUTH_RATE_LIMIT_ENABLED:true}
     requests-per-minute: ${AUTH_RATE_LIMIT_RPM:60}
@@ -83,6 +84,7 @@ auth:
     key-hmac-secret: "test-hmac-secret-exactly-32-chars!!"
     session:
       cookie-domain: "localhost"
+    mfa-hmac-secret: "test-mfa-hmac-secret-32-chars!!!!"
     rate-limit:
       enabled: false
 
