@@ -3,6 +3,7 @@ package com.authservice
 import com.authservice.domain.AppEntity
 import com.authservice.domain.AppRepository
 import com.authservice.domain.AuthTokenRepository
+import com.authservice.domain.RefreshTokenRepository
 import com.authservice.domain.UserAppAccessRepository
 import com.authservice.domain.UserRepository
 import io.quarkus.test.junit.QuarkusTest
@@ -23,10 +24,12 @@ class AuthResourceTest {
     @Inject lateinit var appRepository: AppRepository
     @Inject lateinit var accessRepository: UserAppAccessRepository
     @Inject lateinit var authTokenRepository: AuthTokenRepository
+    @Inject lateinit var refreshTokenRepository: RefreshTokenRepository
 
     @BeforeEach
     @Transactional
     fun cleanup() {
+        refreshTokenRepository.deleteAll()
         authTokenRepository.deleteAll()
         accessRepository.deleteAll()
         userRepository.deleteAll()
@@ -39,7 +42,7 @@ class AuthResourceTest {
     fun `register returns 201 with token and user`() {
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"alice@example.com","password":"password123","name":"Alice"}""")
+            .body("""{"email":"alice@example.com","password":"Str0ng!Pass42","name":"Alice"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(201)
@@ -54,7 +57,7 @@ class AuthResourceTest {
     fun `register normalises email to lowercase`() {
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"BOB@EXAMPLE.COM","password":"password123"}""")
+            .body("""{"email":"BOB@EXAMPLE.COM","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(201)
@@ -65,7 +68,7 @@ class AuthResourceTest {
     fun `register without name defaults to email prefix`() {
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"carol@example.com","password":"password123"}""")
+            .body("""{"email":"carol@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(201)
@@ -74,7 +77,7 @@ class AuthResourceTest {
 
     @Test
     fun `register duplicate email returns 400`() {
-        val body = """{"email":"dup@example.com","password":"password123"}"""
+        val body = """{"email":"dup@example.com","password":"Str0ng!Pass42"}"""
         given().contentType(ContentType.JSON).body(body).`when`().post("/auth/register").then().statusCode(201)
 
         given()
@@ -100,7 +103,7 @@ class AuthResourceTest {
     fun `register with invalid email returns 400`() {
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"not-an-email","password":"password123"}""")
+            .body("""{"email":"not-an-email","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(400)
@@ -110,11 +113,11 @@ class AuthResourceTest {
 
     @Test
     fun `login returns token`() {
-        register("dave@example.com", "password123")
+        register("dave@example.com", "Str0ng!Pass42")
 
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"dave@example.com","password":"password123"}""")
+            .body("""{"email":"dave@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/login")
         .then()
             .statusCode(200)
@@ -124,11 +127,11 @@ class AuthResourceTest {
 
     @Test
     fun `login is case-insensitive for email`() {
-        register("EVE@EXAMPLE.COM", "password123")
+        register("EVE@EXAMPLE.COM", "Str0ng!Pass42")
 
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"eve@example.com","password":"password123"}""")
+            .body("""{"email":"eve@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/login")
         .then()
             .statusCode(200)
@@ -151,7 +154,7 @@ class AuthResourceTest {
     fun `login unknown email returns 401`() {
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"ghost@example.com","password":"password123"}""")
+            .body("""{"email":"ghost@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/login")
         .then()
             .statusCode(401)
@@ -183,7 +186,7 @@ class AuthResourceTest {
 
     @Test
     fun `me returns current user for valid token`() {
-        val token = registerAndGetToken("henry@example.com", "password123")
+        val token = registerAndGetToken("henry@example.com", "Str0ng!Pass42")
 
         given()
             .header("Authorization", "Bearer $token")
@@ -226,7 +229,7 @@ class AuthResourceTest {
 
     @Test
     fun `deleteAccount removes user and returns 204`() {
-        val token = registerAndGetToken("ivan@example.com", "password123")
+        val token = registerAndGetToken("ivan@example.com", "Str0ng!Pass42")
 
         given()
             .header("Authorization", "Bearer $token")

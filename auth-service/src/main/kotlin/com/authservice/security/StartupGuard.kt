@@ -36,6 +36,8 @@ class StartupGuard @Inject constructor(
         if (value in DEV_DEFAULTS) {
             val msg = "$name is using the default dev value. Set it to a unique secret in production."
             if (isProd()) throw IllegalStateException(msg) else log.warn(msg)
+        } else if (isProd() && value.length < 32) {
+            throw IllegalStateException("$name must be at least 32 characters in production (got ${value.length}).")
         }
     }
 

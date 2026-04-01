@@ -31,8 +31,11 @@ quarkus:
 
 auth:
   jwt:
-    # Token expiry in seconds. Default 7 days.
-    expiry-seconds: ${AUTH_JWT_EXPIRY_SECONDS:604800}
+    # Access token expiry in seconds. Default 15 minutes (short-lived; use refresh tokens for longevity).
+    expiry-seconds: ${AUTH_JWT_EXPIRY_SECONDS:900}
+  refresh-token:
+    # Refresh token expiry in seconds. Default 7 days.
+    expiry-seconds: ${AUTH_REFRESH_TOKEN_EXPIRY_SECONDS:604800}
   admin-key: ${AUTH_ADMIN_KEY:}
   # HMAC-SHA256 secrets — three separate secrets to limit blast radius if one leaks.
   # auth.key-hmac-secret  → admin key comparison (ApiKeyHasher)
@@ -53,6 +56,10 @@ auth:
       client-secret: ${GITHUB_CLIENT_SECRET:}
   # Base URL used to build OAuth callback URLs and token links.
   base-url: ${AUTH_BASE_URL:http://localhost:8703}
+  session:
+    # Cookie domain for platform_session cookie (e.g. ".homelab.local" for *.homelab.local).
+    # Leave empty for localhost/dev (cookie scoped to auth-service origin only).
+    cookie-domain: ${AUTH_SESSION_COOKIE_DOMAIN:}
 
 "%dev":
   quarkus:
@@ -74,6 +81,8 @@ auth:
     state-hmac-secret: "test-state-hmac-secret-32-chars!!"
     token-pepper: "test-token-pepper-exactly-32chars!!"
     key-hmac-secret: "test-hmac-secret-exactly-32-chars!!"
+    session:
+      cookie-domain: "localhost"
     rate-limit:
       enabled: false
 

@@ -2,6 +2,7 @@ package com.authservice
 
 import com.authservice.domain.AppRepository
 import com.authservice.domain.AuthTokenRepository
+import com.authservice.domain.RefreshTokenRepository
 import com.authservice.domain.UserAppAccessRepository
 import com.authservice.domain.UserRepository
 import com.authservice.security.RateLimiter
@@ -35,11 +36,13 @@ class RateLimitTest {
     @Inject lateinit var appRepository: AppRepository
     @Inject lateinit var accessRepository: UserAppAccessRepository
     @Inject lateinit var authTokenRepository: AuthTokenRepository
+    @Inject lateinit var refreshTokenRepository: RefreshTokenRepository
     @Inject lateinit var rateLimiter: RateLimiter
 
     @BeforeEach
     @Transactional
     fun cleanup() {
+        refreshTokenRepository.deleteAll()
         authTokenRepository.deleteAll()
         accessRepository.deleteAll()
         userRepository.deleteAll()
@@ -53,7 +56,7 @@ class RateLimitTest {
         repeat(2) { i ->
             given()
                 .contentType(ContentType.JSON)
-                .body("""{"email":"rl$i@example.com","password":"password123"}""")
+                .body("""{"email":"rl$i@example.com","password":"Str0ng!Pass42"}""")
             .`when`().post("/auth/register")
             .then()
                 .statusCode(201)
@@ -62,7 +65,7 @@ class RateLimitTest {
         // Third request from the same IP bucket hits the limit
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"rl3@example.com","password":"password123"}""")
+            .body("""{"email":"rl3@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(429)
@@ -79,14 +82,14 @@ class RateLimitTest {
 
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"limited@example.com","password":"password123"}""")
+            .body("""{"email":"limited@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(201)
 
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"limited2@example.com","password":"password123"}""")
+            .body("""{"email":"limited2@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(201)
@@ -94,7 +97,7 @@ class RateLimitTest {
         // Bucket is now at limit — login should be blocked
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"limited@example.com","password":"password123"}""")
+            .body("""{"email":"limited@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/login")
         .then()
             .statusCode(429)

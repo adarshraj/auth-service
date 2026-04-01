@@ -2,6 +2,7 @@ package com.authservice
 
 import com.authservice.domain.AppRepository
 import com.authservice.domain.AuthTokenRepository
+import com.authservice.domain.RefreshTokenRepository
 import com.authservice.domain.UserAppAccessRepository
 import com.authservice.domain.UserRepository
 import io.quarkus.test.junit.QuarkusTest
@@ -21,12 +22,14 @@ class AppResourceTest {
     @Inject lateinit var appRepository: AppRepository
     @Inject lateinit var accessRepository: UserAppAccessRepository
     @Inject lateinit var authTokenRepository: AuthTokenRepository
+    @Inject lateinit var refreshTokenRepository: RefreshTokenRepository
 
     private val adminKey = "test-admin-key"
 
     @BeforeEach
     @Transactional
     fun cleanup() {
+        refreshTokenRepository.deleteAll()
         authTokenRepository.deleteAll()
         accessRepository.deleteAll()
         userRepository.deleteAll()
@@ -229,7 +232,7 @@ class AppResourceTest {
         given()
             .contentType(ContentType.JSON)
             .header("X-App-Id", "private-app")
-            .body("""{"email":"newuser@example.com","password":"password123"}""")
+            .body("""{"email":"newuser@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(201)
@@ -238,7 +241,7 @@ class AppResourceTest {
         given()
             .contentType(ContentType.JSON)
             .header("X-App-Id", "private-app")
-            .body("""{"email":"newuser@example.com","password":"password123"}""")
+            .body("""{"email":"newuser@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/login")
         .then()
             .statusCode(200)
@@ -252,7 +255,7 @@ class AppResourceTest {
         // Register without X-App-Id — no auto-grant
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"outsider@example.com","password":"password123"}""")
+            .body("""{"email":"outsider@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(201)
@@ -261,7 +264,7 @@ class AppResourceTest {
         given()
             .contentType(ContentType.JSON)
             .header("X-App-Id", "exclusive-app")
-            .body("""{"email":"outsider@example.com","password":"password123"}""")
+            .body("""{"email":"outsider@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/login")
         .then()
             .statusCode(403)
@@ -274,7 +277,7 @@ class AppResourceTest {
 
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"anyone@example.com","password":"password123"}""")
+            .body("""{"email":"anyone@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(201)
@@ -282,7 +285,7 @@ class AppResourceTest {
         given()
             .contentType(ContentType.JSON)
             .header("X-App-Id", "open-app")
-            .body("""{"email":"anyone@example.com","password":"password123"}""")
+            .body("""{"email":"anyone@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/login")
         .then()
             .statusCode(200)
@@ -294,7 +297,7 @@ class AppResourceTest {
 
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"freeuser@example.com","password":"password123"}""")
+            .body("""{"email":"freeuser@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(201)
@@ -302,7 +305,7 @@ class AppResourceTest {
         // No X-App-Id → gate is not checked → login succeeds
         given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"freeuser@example.com","password":"password123"}""")
+            .body("""{"email":"freeuser@example.com","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/login")
         .then()
             .statusCode(200)
@@ -335,7 +338,7 @@ class AppResourceTest {
     private fun registerAndGetUserId(email: String): String {
         return given()
             .contentType(ContentType.JSON)
-            .body("""{"email":"$email","password":"password123"}""")
+            .body("""{"email":"$email","password":"Str0ng!Pass42"}""")
         .`when`().post("/auth/register")
         .then()
             .statusCode(201)

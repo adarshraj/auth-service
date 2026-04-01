@@ -3,6 +3,8 @@ package com.authservice.service
 import com.authservice.domain.AppRepository
 import com.authservice.domain.AuthTokenEntity
 import com.authservice.domain.AuthTokenRepository
+import com.authservice.domain.RefreshTokenEntity
+import com.authservice.domain.RefreshTokenRepository
 import com.authservice.domain.UserAppAccessEntity
 import com.authservice.domain.UserAppAccessId
 import com.authservice.domain.UserAppAccessRepository
@@ -30,8 +32,10 @@ class UserService @Inject constructor(
     private val appRepository: AppRepository,
     private val accessRepository: UserAppAccessRepository,
     private val authTokenRepository: AuthTokenRepository,
+    private val refreshTokenRepository: RefreshTokenRepository,
     private val passwordService: PasswordService,
     @ConfigProperty(name = "auth.token-pepper") private val tokenPepper: String,
+    @ConfigProperty(name = "auth.refresh-token.expiry-seconds", defaultValue = "604800") private val refreshTokenExpirySeconds: Long,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(UserService::class.java)
@@ -50,8 +54,16 @@ class UserService @Inject constructor(
 
     @Transactional
     fun register(email: String, password: String?, name: String?, appId: String?): UserView {
+        if (password == null) {
+            throw BadRequestException("Password is required")
+        }
+        if (passwordService.isCommon(password)) {
+            throw BadRequestException("This password is too common — please choose a stronger one")
+        }
         val normalizedEmail = email.lowercase().trim()
         if (userRepository.findByEmail(normalizedEmail) != null) {
+            // Perform a dummy hash to equalize timing — prevents email enumeration via response time
+            passwordService.dummyHash()
             // Generic message — do not reveal whether the email is registered (prevents enumeration)
             throw BadRequestException("Registration failed — check your details and try again")
         }
@@ -84,11 +96,16 @@ class UserService @Inject constructor(
         val normalizedEmail = email.lowercase().trim()
         val user = userRepository.findByEmail(normalizedEmail)
             ?: run {
+                // Dummy verify to equalize timing — without this, unknown-email responses are
+                // measurably faster (no bcrypt), revealing whether the email is registered.
+                passwordService.dummyVerify(password)
                 log.infof("AUDIT login_failed reason=unknown_email email=%s app=%s", normalizedEmail, appId ?: "none")
                 throw NotAuthorizedException("Invalid email or password", "Bearer")
             }
 
         if (user.passwordHash == null) {
+            // Dummy verify to equalize timing with the has-password path
+            passwordService.dummyVerify(password)
             // Generic message — do not reveal that this email is registered via OAuth only (account enumeration)
             log.infof("AUDIT login_failed reason=no_password userId=%s app=%s", user.id, appId ?: "none")
             throw NotAuthorizedException("Invalid email or password", "Bearer")
@@ -174,6 +191,7 @@ class UserService @Inject constructor(
     fun deleteAccount(userId: String) {
         val user = userRepository.findById(userId) ?: throw NotFoundException("User not found")
         log.infof("AUDIT account_deleted userId=%s email=%s", user.id, user.email)
+        revokeAllRefreshTokens(userId)
         userRepository.delete(user)
     }
 
@@ -222,20 +240,66 @@ class UserService @Inject constructor(
 
     @Transactional
     fun consumeAuthToken(rawToken: String, expectedType: String): String {
-        val entity = authTokenRepository.findByToken(Hmac.sha256(rawToken, tokenPepper))
-            ?: throw BadRequestException("Invalid token")
-        if (entity.used) throw BadRequestException("Token already used")
-        if (entity.type != expectedType) throw BadRequestException("Invalid token type")
-        if (entity.expiresAt.isBefore(Instant.now())) throw BadRequestException("Token expired")
-        entity.used = true
+        // Atomic UPDATE-before-SELECT eliminates the TOCTOU race where two concurrent
+        // requests could both read used=false and both succeed.
+        val entity = authTokenRepository.claimToken(Hmac.sha256(rawToken, tokenPepper), expectedType)
+            ?: throw BadRequestException("Invalid or expired token")
         return entity.userId
+    }
+
+    // ── Refresh tokens ─────────────────────────────────────────────────────────
+
+    /** Issue a new refresh token. Returns the raw (unhashed) token. */
+    @Transactional
+    fun issueRefreshToken(userId: String, appId: String?): String {
+        val rawToken = generateToken()
+        refreshTokenRepository.persist(RefreshTokenEntity().apply {
+            id = generateId()
+            this.userId = userId
+            this.token = Hmac.sha256(rawToken, tokenPepper)
+            this.appId = appId
+            this.expiresAt = Instant.now().plusSeconds(refreshTokenExpirySeconds)
+            this.revoked = false
+            this.createdAt = Instant.now()
+        })
+        return rawToken
+    }
+
+    /**
+     * Rotate a refresh token: atomically revokes the old one and issues a new one.
+     * Returns (userId, appId, newRawRefreshToken) or throws if the token is invalid/expired/revoked.
+     */
+    @Transactional
+    fun rotateRefreshToken(rawToken: String): Triple<String, String?, String> {
+        val entity = refreshTokenRepository.claimToken(Hmac.sha256(rawToken, tokenPepper))
+            ?: throw NotAuthorizedException("Invalid or expired refresh token", "Bearer")
+        // Verify the user still exists
+        userRepository.findById(entity.userId)
+            ?: throw NotAuthorizedException("User no longer exists", "Bearer")
+        val newRawToken = issueRefreshToken(entity.userId, entity.appId)
+        return Triple(entity.userId, entity.appId, newRawToken)
+    }
+
+    /** Revoke all refresh tokens for a user (on account deletion). */
+    @Transactional
+    fun revokeAllRefreshTokens(userId: String) {
+        refreshTokenRepository.revokeAllForUser(userId)
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
+    /** Validate that the app ID refers to a registered app. Returns null if appId is null. */
+    fun validateAppId(appId: String?): String? {
+        if (appId == null) return null
+        appRepository.findById(appId)
+            ?: throw BadRequestException("Unknown app: $appId")
+        return appId
+    }
+
     private fun checkAppAccess(user: UserEntity, appId: String?) {
         if (appId == null) return
-        val app = appRepository.findById(appId) ?: return
+        val app = appRepository.findById(appId)
+            ?: throw BadRequestException("Unknown app: $appId")
         if (app.requiresExplicitAccess && !accessRepository.hasAccess(user.id, appId)) {
             throw ForbiddenException("You do not have access to this application")
         }

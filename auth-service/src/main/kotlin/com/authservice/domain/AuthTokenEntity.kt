@@ -41,6 +41,20 @@ class AuthTokenRepository : PanacheRepositoryBase<AuthTokenEntity, String> {
     fun findByToken(token: String): AuthTokenEntity? =
         find("token", token).firstResult()
 
+    /**
+     * Atomically claims a token: marks it used and returns the entity — or returns null
+     * if the token doesn't exist, is already used, has the wrong type, or has expired.
+     * Uses UPDATE-before-SELECT to eliminate the TOCTOU race (same pattern as OAuthCodeRepository.claimCode).
+     */
+    fun claimToken(tokenHash: String, expectedType: String): AuthTokenEntity? {
+        val updated = update(
+            "used = true WHERE token = ?1 AND type = ?2 AND used = false AND expiresAt > ?3",
+            tokenHash, expectedType, Instant.now(),
+        )
+        if (updated == 0) return null
+        return find("token", tokenHash).firstResult()
+    }
+
     /** Remove tokens older than 30 days to keep the table lean. */
     fun deleteExpiredBefore(cutoff: Instant): Long =
         delete("expiresAt < ?1", cutoff)

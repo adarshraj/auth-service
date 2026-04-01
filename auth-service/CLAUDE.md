@@ -39,15 +39,17 @@ SQLite is used by default — no database setup needed for development.
 
 Layered under `src/main/kotlin/com/authservice/`:
 
-- **`api/`** — JAX-RS resources (`AuthResource`, `AppResource`, `WellKnownResource`), DTOs, and exception mappers. Resources delegate all logic to services.
+- **`api/`** — JAX-RS resources (`AuthResource`, `AppResource`, `VerifyResource`, `WellKnownResource`), DTOs, and exception mappers. Resources delegate all logic to services.
 - **`service/`** — Business logic: `UserService` (registration, login, OAuth account linking, access management, auth tokens), `JwtService` (sign/verify ES256), `EcKeyService` (generate/persist/expose EC P-256 key pair), `PasswordService` (bcrypt), `OAuthService` (Google + GitHub flows), `TokenCleanupJob` (scheduled purge).
-- **`domain/`** — JPA entities and Panache repositories: `UserEntity`, `AppEntity`, `UserAppAccessEntity` (composite PK), `AuthTokenEntity`, `EcKeyEntity`, `OAuthCodeEntity`.
-- **`security/`** — `JwtFilter` (protects `/auth/me` and `/auth/account`), `RateLimiter` (in-memory fixed-window), `OAuthNonceStore` (single-use nonce validation for OAuth CSRF protection), `ApiKeyHasher` (HMAC-SHA256 for admin key), `CallerContext` (request-scoped user identity), `StartupGuard` (validates required secrets on boot).
+- **`domain/`** — JPA entities and Panache repositories: `UserEntity`, `AppEntity`, `UserAppAccessEntity` (composite PK), `AuthTokenEntity`, `RefreshTokenEntity`, `EcKeyEntity`, `OAuthCodeEntity`.
+- **`security/`** — `JwtFilter` (protects `/auth/me` and `/auth/account`), `SessionCookieFilter` (sets/clears `platform_session` HttpOnly cookie on auth responses), `RateLimiter` (in-memory fixed-window), `OAuthNonceStore` (single-use nonce validation for OAuth CSRF protection), `ApiKeyHasher` (HMAC-SHA256 for admin key), `CallerContext` (request-scoped user identity), `StartupGuard` (validates required secrets on boot), `SecurityHeadersFilter` (adds X-Content-Type-Options, X-Frame-Options, CSP, HSTS, Referrer-Policy to all responses).
 - **`config/`** — `RateLimitConfig` and `OAuthConfig` ConfigMapping interfaces.
 
 ### Key flows
 
-**Login:** `AuthResource.login()` → `UserService.login()` (verify bcrypt, check app gate) → `JwtService.sign()` → `AuthResponse{token, user}`
+**Login:** `AuthResource.login()` → `UserService.login()` (verify bcrypt, check app gate) → `JwtService.sign()` + `UserService.issueRefreshToken()` → `AuthResponse{token, refreshToken, user}`
+
+**Token refresh:** `POST /auth/refresh` (form: `refresh_token=<token>`) → `UserService.rotateRefreshToken()` (atomically revokes old token, issues new one) → new `AuthResponse{token, refreshToken, user}`. Refresh tokens are single-use (rotation) with a 7-day TTL. Access tokens are short-lived (15 minutes by default).
 
 **OAuth (browser flow with redirect_uri):**
 1. `GET /auth/oauth/{provider}?redirect_uri=https://app.com/cb` (with `X-App-Id`)
@@ -72,6 +74,7 @@ Layered under `src/main/kotlin/com/authservice/`:
 | V5 | `apps.redirect_uris` | Newline-separated allowed redirect URIs per app |
 | V6 | `ec_keys` | Persisted EC P-256 key pair (single row, id=`primary`) |
 | V7 | `oauth_codes` | Short-lived one-time codes for the OAuth browser redirect flow (60s TTL) |
+| V8 | `refresh_tokens` | Revocable refresh tokens for access token rotation (7-day TTL, HMAC-hashed at rest) |
 
 ### Admin key security
 
@@ -81,11 +84,32 @@ All admin endpoints are rate-limited at 20 RPM per IP (`AppResource.ADMIN_RPM`).
 
 **Admin API is disabled** (returns 501) if `AUTH_ADMIN_KEY` is not set. Apps still work — only the `/auth/apps` management endpoints are gated.
 
-### Auth token and OAuth code security
+### Auth token, refresh token, and OAuth code security
 
-`auth_tokens` and `oauth_codes` are stored as `HMAC(value, AUTH_TOKEN_PEPPER)`, not plaintext. `UserService.createAuthToken()` and `AuthResource.issueOAuthCode()` return the raw value to the caller and store only the hash; lookup hashes the incoming value before querying. A full DB dump does not expose redeemable tokens or codes.
+`auth_tokens`, `refresh_tokens`, and `oauth_codes` are stored as `HMAC(value, AUTH_TOKEN_PEPPER)`, not plaintext. `UserService.createAuthToken()`, `UserService.issueRefreshToken()`, and `AuthResource.issueOAuthCode()` return the raw value to the caller and store only the hash; lookup hashes the incoming value before querying. A full DB dump does not expose redeemable tokens or codes.
 
-OAuth code exchange (`POST /auth/token`) uses `OAuthCodeRepository.claimCode()` which atomically marks the code used via `UPDATE ... WHERE used=false` before returning it. This eliminates the TOCTOU race where two concurrent requests could both exchange the same one-time code.
+All three token types use atomic `UPDATE ... WHERE used/revoked=false` claiming to eliminate TOCTOU races:
+- `OAuthCodeRepository.claimCode()` — OAuth one-time codes
+- `AuthTokenRepository.claimToken()` — password-reset / magic-link tokens
+- `RefreshTokenRepository.claimToken()` — refresh tokens (single-use rotation)
+
+Refresh tokens are single-use: exchanging one (`POST /auth/refresh`) atomically revokes the old token and issues a new one (rotation). All refresh tokens for a user are revoked on account deletion.
+
+### Session cookie and forward auth
+
+`SessionCookieFilter` is a JAX-RS `ContainerResponseFilter` that automatically sets a `platform_session` cookie on successful auth responses (login, register, refresh, token exchange) and clears it on logout. Cookie attributes:
+- `HttpOnly` — not accessible to JavaScript (XSS protection)
+- `Secure` — only sent over HTTPS
+- `SameSite=Lax` — CSRF protection for top-level navigations
+- `Domain` — set to `AUTH_SESSION_COOKIE_DOMAIN` (e.g. `.homelab.local` for cross-subdomain access); empty for localhost/dev
+- `Max-Age` — matches `AUTH_JWT_EXPIRY_SECONDS` (15 minutes by default)
+- `Path=/` — available to all paths
+
+`VerifyResource` (`GET /auth/verify`) serves as a forward-auth endpoint for any reverse proxy (Traefik, nginx, Caddy, HAProxy, etc.). It accepts auth via:
+1. `platform_session` cookie (browser access to admin UIs)
+2. `Authorization: Bearer <token>` header (API access)
+
+Returns 200 with `X-Auth-User-Id` and `X-Auth-User-Email` headers (forwarded to downstream services by the reverse proxy), or 401 with `X-Auth-Redirect: true` so middleware can redirect to login.
 
 ### OAuth state integrity and CSRF protection
 
@@ -137,6 +161,7 @@ Critical security events are logged at `INFO` level with an `AUDIT` prefix for e
 | Login failure | `AUDIT login_failed reason=… userId/email=… app=…` |
 | Account deleted | `AUDIT account_deleted userId=… email=…` |
 | OAuth token exchanged | `AUDIT token_exchanged userId=… app=…` |
+| Token refreshed | `AUDIT token_refreshed userId=… app=…` |
 | Admin auth failure | `AUDIT admin_auth_failed reason=… ip=…` |
 
 To stream audit events: `grep AUDIT <logfile>` or configure your log aggregator to filter on `AUDIT`.
@@ -145,11 +170,13 @@ To stream audit events: `grep AUDIT <logfile>` or configure your log aggregator 
 
 | Config path | Env var | Purpose |
 |---|---|---|
-| `auth.jwt.expiry-seconds` | `AUTH_JWT_EXPIRY_SECONDS` | Token TTL (default 604800 = 7 days) |
+| `auth.jwt.expiry-seconds` | `AUTH_JWT_EXPIRY_SECONDS` | Access token TTL (default 900 = 15 minutes) |
+| `auth.refresh-token.expiry-seconds` | `AUTH_REFRESH_TOKEN_EXPIRY_SECONDS` | Refresh token TTL (default 604800 = 7 days) |
 | `auth.admin-key` | `AUTH_ADMIN_KEY` | Key for `/auth/apps` endpoints (optional — disables app mgmt if unset) |
 | `auth.key-hmac-secret` | `AUTH_KEY_HMAC_SECRET` | HMAC-SHA256 secret for admin key hashing (min 32 chars, required in prod) |
 | `auth.state-hmac-secret` | `AUTH_STATE_HMAC_SECRET` | HMAC secret for signing OAuth state params (prevents open redirect / CSRF; required in prod) |
 | `auth.token-pepper` | `AUTH_TOKEN_PEPPER` | HMAC pepper for storing auth tokens and OAuth codes at rest (required in prod) |
+| `auth.session.cookie-domain` | `AUTH_SESSION_COOKIE_DOMAIN` | Cookie domain for `platform_session` (e.g. `.homelab.local`; empty for localhost) |
 | `auth.rate-limit.enabled` | `AUTH_RATE_LIMIT_ENABLED` | Toggle rate limiting (default true) |
 | `auth.rate-limit.requests-per-minute` | `AUTH_RATE_LIMIT_RPM` | Per-IP limit for auth endpoints (default 60) |
 | `auth.oauth.google.client-id` | `GOOGLE_CLIENT_ID` | Google OAuth |
@@ -176,7 +203,8 @@ To stream audit events: `grep AUDIT <logfile>` or configure your log aggregator 
 
 **Adding a new auth token type:**
 - Add a string constant for the type (e.g. `"email_verification"`).
-- Call `userService.createAuthToken(userId, type, ttlHours)` to generate; call `userService.consumeAuthToken(token, type)` to validate and mark used.
+- Call `userService.createAuthToken(userId, type, ttlHours)` to generate; call `userService.consumeAuthToken(token, type)` to validate and atomically mark used.
+- `consumeAuthToken` uses `AuthTokenRepository.claimToken()` which atomically marks the token used via `UPDATE ... WHERE used=false` — safe against concurrent redemption.
 - The `TokenCleanupJob` automatically purges tokens older than 30 days.
 - Note: `auth_tokens` infrastructure exists in the DB (V4 migration) but no REST endpoints currently expose it — it is reserved for future password-reset / magic-link / email-verification flows.
 
@@ -187,7 +215,11 @@ To stream audit events: `grep AUDIT <logfile>` or configure your log aggregator 
 
 ## bcrypt compatibility
 
-`PasswordService` uses `at.favre.lib:bcrypt` at cost factor 10, producing `$2a$10$...` hashes. This is byte-for-byte compatible with Node's `bcrypt` npm package at cost 10 — finance-tracker's existing user `password_hash` values can be imported directly into the `users` table without re-hashing.
+`PasswordService` uses `at.favre.lib:bcrypt` at cost factor 12, producing `$2a$12$...` hashes (upgraded from cost 10 per OWASP recommendation). Existing cost-10 hashes from finance-tracker remain verifiable — bcrypt encodes the cost factor in the hash string, so `BCrypt.verifyer()` handles both transparently. New registrations produce cost-12 hashes.
+
+### Common password rejection
+
+`PasswordService` loads `common-passwords.txt` at startup into an in-memory `Set`. Registration rejects passwords found in this list regardless of length. The list contains ~300 of the most commonly breached passwords.
 
 ## JWT format
 
@@ -295,3 +327,99 @@ Tokens issued without `X-App-Id` have no `groups` claim. Tokens with `X-App-Id` 
 
 **10. `auth_tokens` dead code documented**
 - The `auth_tokens` table (V4 migration) and `UserService.createAuthToken/consumeAuthToken` exist for future password-reset / magic-link flows. No REST endpoints currently expose them. Documented as reserved.
+
+### Security hardening phase 2 (2026-04-01)
+
+#### Critical fixes
+
+**1. `consumeAuthToken` TOCTOU race eliminated**
+- Added `AuthTokenRepository.claimToken()` — atomically marks the token used via `UPDATE ... WHERE used=false AND type=? AND expiresAt > now` before returning the entity. Mirrors the `OAuthCodeRepository.claimCode()` pattern.
+- `UserService.consumeAuthToken()` now uses the atomic method instead of the previous select-then-update pattern.
+- This was a latent bug (no REST endpoints expose auth tokens yet) that would have become exploitable when password-reset or magic-link flows are added.
+
+**2. Refresh token support with short-lived access tokens**
+- Access token TTL reduced from 7 days to **15 minutes** (`AUTH_JWT_EXPIRY_SECONDS` default changed from 604800 to 900).
+- New `refresh_tokens` table (V8 migration) — HMAC-hashed at rest, revocable, 7-day TTL.
+- New `RefreshTokenEntity` + `RefreshTokenRepository` with atomic `claimToken()` (single-use rotation) and `revokeAllForUser()`.
+- New `POST /auth/refresh` endpoint — accepts `refresh_token` form param, atomically revokes old token, issues new access + refresh token pair.
+- All four token-issuing paths (register, login, OAuth callback, token exchange) now return `refreshToken` in the response.
+- Account deletion revokes all refresh tokens via `UserService.revokeAllRefreshTokens()`.
+- `TokenCleanupJob` purges expired refresh tokens older than 14 days.
+- `AuthResponse` DTO gained a `refreshToken` field.
+
+**3. Common password rejection**
+- `PasswordService` loads `common-passwords.txt` (~300 entries) at startup into an in-memory `Set`.
+- `PasswordService.isCommon(password)` checks against the list (case-insensitive).
+- `UserService.register()` rejects common passwords with a clear error message before proceeding.
+
+#### Medium fixes
+
+**4. Registration timing side-channel fixed**
+- `PasswordService.dummyHash()` performs a bcrypt hash to equalize response timing.
+- Called on the duplicate-email registration failure path, so an attacker cannot distinguish "email already registered" from "new registration" by measuring response time.
+
+**5. bcrypt cost factor increased from 10 to 12**
+- Per OWASP recommendation. Cost 12 is ~4x slower to hash than cost 10, significantly increasing brute-force resistance.
+- Existing cost-10 hashes from finance-tracker remain verifiable — bcrypt encodes the cost factor in the hash string.
+- New registrations produce `$2a$12$...` hashes.
+
+**6. Security response headers added**
+- New `SecurityHeadersFilter` (JAX-RS `ContainerResponseFilter`) adds standard security headers to all responses:
+  - `X-Content-Type-Options: nosniff`
+  - `X-Frame-Options: DENY`
+  - `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`
+  - `Referrer-Policy: strict-origin-when-cross-origin`
+  - `Strict-Transport-Security: max-age=31536000; includeSubDomains`
+  - `X-XSS-Protection: 0` (disabled per modern best practice; CSP supersedes it)
+
+**7. Login timing side-channel fixed**
+- `PasswordService.dummyVerify()` performs a bcrypt verify against a pre-computed cost-12 hash.
+- Called on both the unknown-email and no-password (OAuth-only) login failure paths, so response time is constant regardless of whether the email exists.
+
+**8. Unknown app IDs rejected**
+- `UserService.validateAppId(appId)` throws `BadRequestException` if `X-App-Id` does not match a registered app.
+- Called in `AuthResource` for register, login, and OAuth redirect — prevents issuing JWTs with arbitrary `aud` claims.
+- `checkAppAccess()` also rejects unknown app IDs instead of silently passing.
+
+**9. Password required on public registration**
+- `UserService.register()` now throws `BadRequestException("Password is required")` if password is null.
+- Prevents email squatting where an attacker registers `victim@example.com` without a password to block the victim's OAuth-first signup (409 conflict).
+- Passwordless accounts are still created via the OAuth flow (`findOrCreateByOAuth`), which does not go through `register()`.
+
+**10. Production secret quality enforced**
+- `StartupGuard` now enforces a minimum length of 32 characters for all three HMAC secrets in prod, in addition to checking they are not the dev defaults.
+- Weak but non-default secrets (e.g. `"abc"`) are now rejected at boot.
+
+### Known limitations and operational notes
+
+#### Single-instance constraints
+- **`OAuthNonceStore`** and **`RateLimiter`** are in-memory. With multiple instances, OAuth nonces are not shared (callbacks may fail if they hit a different instance than the redirect), and effective rate limits multiply by instance count. Use sticky sessions or a shared store (Redis) if scaling horizontally.
+
+#### Stateless logout and incident response
+- `POST /auth/logout` clears the `platform_session` cookie but does not revoke refresh tokens or block existing access JWTs. Access tokens remain valid until their 15-minute expiry.
+- **Incident response playbook:** On compromise, rotate `AUTH_TOKEN_PEPPER` (invalidates all refresh tokens at rest) and wipe the `ec_keys` table (invalidates all access JWTs immediately since a new signing key is generated on next boot). The short access token TTL limits the window of exposure.
+
+#### HSTS over HTTP
+- `SecurityHeadersFilter` sends `Strict-Transport-Security` on all responses. Browsers ignore it over plain HTTP, so it is harmless but slightly noisy for local HTTP-only dev setups.
+
+#### JWT PII considerations
+- JWTs contain `email` in the payload. Consuming services should avoid logging raw tokens, as they become PII in log aggregators and caches. Log `userId` instead.
+
+#### Refresh token rate limiting
+- `POST /auth/refresh` is only rate-limited per-IP (no per-account bucket like login). Offline guessing is infeasible given the 256-bit token entropy, but per-account limiting would be defense-in-depth if needed.
+
+#### Health and metrics endpoints
+- `/q/health`, `/q/metrics`, and `/q/dev` are exposed by Quarkus. Ensure your reverse proxy does not expose these publicly if your network model requires it.
+
+#### Dependency / CVE hygiene
+- No automated SCA scanner is configured in-repo. Consider adding Dependabot or OSV-Scanner to the CI pipeline for `pom.xml` dependency monitoring.
+
+### Consumer responsibilities (cannot be fixed inside this repo alone)
+
+#### `aud` and `iss` validation
+- `JwtService.verify()` requires `iss` but does not bind `aud`. The `/auth/me` and `/auth/account` endpoints are intentionally app-agnostic — they accept any valid JWT regardless of `aud`.
+- **Consuming services must validate `aud` against their app ID and `iss` against this issuer**, or they may accept tokens minted for another app's audience string.
+
+#### Post-deletion JWT validity
+- After `DELETE /auth/account`, the user's access JWT remains cryptographically valid until expiry (up to 15 minutes). `/auth/me` returns 404, but other consuming services have no built-in way to know the account was deleted.
+- If this becomes a concern, add optional revocation (e.g. check `iat` against a user-level `credentials_changed_at` timestamp, or maintain a short-lived revocation list keyed by `userId`).

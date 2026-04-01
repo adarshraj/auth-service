@@ -81,15 +81,17 @@ class AuthResource @Inject constructor(
         @Context ctx: ContainerRequestContext,
     ): Response {
         checkRateLimit(ctx)
+        val validatedAppId = userService.validateAppId(appId)
         val user = userService.register(
             email = body.email,
             password = body.password,
             name = body.name,
-            appId = appId,
+            appId = validatedAppId,
         )
-        val role = appId?.let { userService.getRole(user.id, it) }
-        val token = jwtService.sign(user.id, user.email, appId, role)
-        return Response.status(201).entity(AuthResponse(token, user.toResponse())).build()
+        val role = validatedAppId?.let { userService.getRole(user.id, it) }
+        val token = jwtService.sign(user.id, user.email, validatedAppId, role)
+        val refreshToken = userService.issueRefreshToken(user.id, validatedAppId)
+        return Response.status(201).entity(AuthResponse(token, refreshToken, user.toResponse())).build()
     }
 
     // ── Login ─────────────────────────────────────────────────────────────────
@@ -103,12 +105,14 @@ class AuthResource @Inject constructor(
         @Context ctx: ContainerRequestContext,
     ): AuthResponse {
         checkRateLimit(ctx)
+        val validatedAppId = userService.validateAppId(appId)
         // Per-account limit: catches distributed brute force that rotates IPs to bypass per-IP limit
         checkRateLimit("auth:account:${body.email.lowercase().trim()}", PER_ACCOUNT_RPM)
-        val user = userService.login(body.email, body.password, appId)
-        val role = appId?.let { userService.getRole(user.id, it) }
-        val token = jwtService.sign(user.id, user.email, appId, role)
-        return AuthResponse(token, user.toResponse())
+        val user = userService.login(body.email, body.password, validatedAppId)
+        val role = validatedAppId?.let { userService.getRole(user.id, it) }
+        val token = jwtService.sign(user.id, user.email, validatedAppId, role)
+        val refreshToken = userService.issueRefreshToken(user.id, validatedAppId)
+        return AuthResponse(token, refreshToken, user.toResponse())
     }
 
     // ── Logout ────────────────────────────────────────────────────────────────
@@ -119,6 +123,26 @@ class AuthResource @Inject constructor(
     @Operation(summary = "Logout (stateless — client drops the token)")
     fun logout(): Response =
         Response.ok(mapOf("message" to "Logged out")).build()
+
+    // ── Refresh ───────────────────────────────────────────────────────────────
+
+    @POST
+    @Path("/refresh")
+    @Consumes(MediaType.APPLICATION_FORM_URLENCODED)
+    @Transactional
+    @Operation(summary = "Exchange a refresh token for a new access token + refresh token (rotation)")
+    fun refresh(
+        @FormParam("refresh_token") @NotBlank refreshToken: String,
+        @Context ctx: ContainerRequestContext,
+    ): AuthResponse {
+        checkRateLimit(ctx)
+        val (userId, appId, newRefreshToken) = userService.rotateRefreshToken(refreshToken)
+        val user = userService.getById(userId)
+        val role = appId?.let { userService.getRole(userId, it) }
+        val token = jwtService.sign(userId, user.email, appId, role)
+        log.infof("AUDIT token_refreshed userId=%s app=%s", userId, appId ?: "none")
+        return AuthResponse(token, newRefreshToken, user.toResponse())
+    }
 
     // ── Me ────────────────────────────────────────────────────────────────────
 
@@ -153,10 +177,11 @@ class AuthResource @Inject constructor(
         @HeaderParam("X-App-Id") appId: String?,
         @QueryParam("redirect_uri") redirectUri: String?,
     ): Response {
+        val validatedAppId = userService.validateAppId(appId)
         if (redirectUri != null) {
-            validateRedirectUri(redirectUri, appId)
+            validateRedirectUri(redirectUri, validatedAppId)
         }
-        val state = buildOAuthState(provider, appId, redirectUri)
+        val state = buildOAuthState(provider, validatedAppId, redirectUri)
         val url = when (provider) {
             "google" -> oauthService.googleAuthUrl(state)
             "github" -> oauthService.githubAuthUrl(state)
@@ -207,7 +232,8 @@ class AuthResource @Inject constructor(
         } else {
             val role = appId?.let { userService.getRole(user.id, it) }
             val token = jwtService.sign(user.id, user.email, appId, role)
-            Response.ok(AuthResponse(token, user.toResponse())).build()
+            val refreshToken = userService.issueRefreshToken(user.id, appId)
+            Response.ok(AuthResponse(token, refreshToken, user.toResponse())).build()
         }
     }
 
@@ -233,8 +259,9 @@ class AuthResource @Inject constructor(
 
         val role = entity.appId?.let { userService.getRole(entity.userId, it) }
         val token = jwtService.sign(entity.userId, entity.email, entity.appId, role)
+        val refreshToken = userService.issueRefreshToken(entity.userId, entity.appId)
         log.infof("AUDIT token_exchanged userId=%s app=%s", entity.userId, entity.appId ?: "none")
-        return AuthResponse(token, user.toResponse())
+        return AuthResponse(token, refreshToken, user.toResponse())
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

@@ -6,7 +6,8 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 
 - Single shared user pool — one account works across all your apps
 - Per-app access gates — apps can require explicit user grants before login is allowed
-- Password login (bcrypt-compatible with finance-tracker hashes)
+- Password login (bcrypt cost 12; compatible with existing cost-10 finance-tracker hashes)
+- Common password rejection (~300 breached passwords blocked at registration)
 - Google and GitHub OAuth with browser-safe redirect flow
 - JWT **ES256** tokens signed with a persisted EC P-256 key pair
 - Public JWKS endpoint — consuming services verify tokens using the public key, no shared secret needed
@@ -27,6 +28,8 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 | `GET`  | `/auth/oauth/{provider}` | Redirect to Google or GitHub; optional `?redirect_uri=` and `X-App-Id` |
 | `GET`  | `/auth/oauth/callback` | OAuth callback — issues a one-time code, redirects to `redirect_uri?code=` |
 | `POST` | `/auth/token` | Exchange one-time code for a JWT (`application/x-www-form-urlencoded`, field: `code`) |
+| `POST` | `/auth/refresh` | Exchange a refresh token for a new access + refresh token (`application/x-www-form-urlencoded`, field: `refresh_token`) |
+| `GET`  | `/auth/verify` | Forward auth — returns 200 (with user identity headers) or 401; accepts `platform_session` cookie or `Authorization: Bearer` |
 | `GET`  | `/.well-known/jwks.json` | Public key in JWK Set format for ES256 token verification |
 
 ### App management (admin — requires `X-Admin-Key`)
@@ -53,11 +56,40 @@ When a client app wants to log a user in via OAuth and receive a JWT:
 
    code=<one-time-code>
    ```
-4. Response is `{ token, user }`. The code is valid for **60 seconds** and single-use.
+4. Response is `{ token, refreshToken, user }`. The code is valid for **60 seconds** and single-use.
 
 The JWT is never placed in a URL or fragment — it only travels over the back-channel exchange.
 
 **`redirect_uri` must be registered** for the app via `POST /auth/apps` (`redirectUris` field) before the flow will work.
+
+## Token refresh
+
+Access tokens are short-lived (15 minutes by default). Use the refresh token to obtain a new access token without re-authenticating:
+
+```
+POST /auth/refresh
+Content-Type: application/x-www-form-urlencoded
+
+refresh_token=<refresh-token>
+```
+
+Response: `{ token, refreshToken, user }`. The old refresh token is revoked and a new one is issued (rotation). Refresh tokens are valid for **7 days** and are single-use.
+
+> **Refresh token rotation:** Each refresh exchanges the old token for a new one. If a refresh token is used twice (indicating theft), the second attempt fails — the legitimate user's next refresh also fails, signaling compromise.
+
+## Session cookie and forward auth
+
+On successful login, register, refresh, or token exchange, the auth-service automatically sets a `platform_session` HttpOnly cookie containing the JWT. This enables browser-based access to admin UIs behind a reverse proxy without manual token management.
+
+**Cookie attributes:** `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`. The `Domain` is set via `AUTH_SESSION_COOKIE_DOMAIN` (e.g. `.homelab.local` to share across subdomains). On logout, the cookie is cleared.
+
+**Forward auth:** Configure your reverse proxy to forward requests to `GET /auth/verify`. The endpoint checks the `platform_session` cookie (browser) or `Authorization: Bearer` header (API). On success, it returns 200 with:
+- `X-Auth-User-Id` — the user's ID
+- `X-Auth-User-Email` — the user's email
+
+The reverse proxy forwards these headers to the downstream service. On failure, it returns 401 with `X-Auth-Redirect: true`.
+
+Works with any reverse proxy that supports forward/external auth — Traefik (`forwardAuth`), nginx (`auth_request`), Caddy (`forward_auth`), HAProxy, etc.
 
 ## Verifying tokens in consuming services
 
@@ -166,7 +198,9 @@ On first register/OAuth-login into a `requiresExplicitAccess: true` app, access 
 | `AUTH_STATE_HMAC_SECRET` | Prod | HMAC secret for signing OAuth state params (prevents open redirect / CSRF) |
 | `AUTH_TOKEN_PEPPER` | Prod | HMAC pepper for storing auth tokens and OAuth codes at rest |
 | `AUTH_BASE_URL` | For OAuth | Base URL for OAuth callback redirect (e.g. `https://auth.example.com`) |
-| `AUTH_JWT_EXPIRY_SECONDS` | No | Token TTL in seconds (default: 604800 = 7 days) |
+| `AUTH_JWT_EXPIRY_SECONDS` | No | Access token TTL in seconds (default: 900 = 15 minutes) |
+| `AUTH_REFRESH_TOKEN_EXPIRY_SECONDS` | No | Refresh token TTL in seconds (default: 604800 = 7 days) |
+| `AUTH_SESSION_COOKIE_DOMAIN` | For cross-subdomain | Cookie domain for `platform_session` (e.g. `.homelab.local`; empty for localhost) |
 | `AUTH_DB_FILE` | No | Path to SQLite DB file (default: `./authservice.db`) |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | For Google OAuth | |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | For GitHub OAuth | |
@@ -178,7 +212,7 @@ On first register/OAuth-login into a `requiresExplicitAccess: true` app, access 
 
 ## Migrating finance-tracker users
 
-finance-tracker uses bcrypt with cost factor 10 — same as this service. Export the `users` table and import directly; no re-hashing needed.
+finance-tracker uses bcrypt with cost factor 10. This service now uses cost 12 for new registrations, but the verifier handles both transparently. Export the `users` table and import directly; no re-hashing needed. Existing users' hashes will be verified at cost 10; new passwords will be hashed at cost 12.
 
 ## Why ES256 and not RS256
 
@@ -202,8 +236,14 @@ ES256 provides stronger security with significantly less CPU cost at signing tim
 | Token audience | `aud` claim set to `appId`; consuming services must validate to prevent cross-app reuse |
 | Token issuer | `iss` set to `AUTH_BASE_URL` (trailing slash stripped); consuming services must validate |
 | Token roles | `groups` claim set to `["user"]` or `["admin"]` from `user_app_access.role`; supports `@RolesAllowed` in Quarkus/MP-JWT |
-| Auth tokens at rest | Password-reset / magic-link tokens and OAuth codes stored as `HMAC(value, AUTH_TOKEN_PEPPER)` — plaintext never written to DB |
-| OAuth code exchange | Atomic `UPDATE ... WHERE used=false` marks the code used before returning it — eliminates the TOCTOU race where two concurrent requests could both redeem the same code |
+| Auth/refresh tokens at rest | Password-reset / magic-link tokens, refresh tokens, and OAuth codes stored as `HMAC(value, AUTH_TOKEN_PEPPER)` — plaintext never written to DB |
+| Token exchange (all types) | Atomic `UPDATE ... WHERE used/revoked=false` marks the token used before returning it — eliminates TOCTOU races for OAuth codes, auth tokens, and refresh tokens |
+| Refresh tokens | Single-use with rotation; 7-day TTL; all revoked on account deletion |
+| Common password rejection | Registration rejects ~300 commonly breached passwords |
+| Login/registration timing equalization | Dummy bcrypt verify/hash on failure paths (unknown email, OAuth-only account, duplicate email) prevents timing-based enumeration |
+| App ID validation | `X-App-Id` must match a registered app — unknown IDs are rejected with 400, preventing JWTs with arbitrary `aud` claims |
+| Password required on registration | `POST /auth/register` requires a password — prevents email squatting that would block OAuth-first signup |
+| Production secret quality | `StartupGuard` enforces minimum 32-character length for all HMAC secrets in prod, not just non-default values |
 | OAuth state | HMAC-signed (`payload~sig`) + single-use nonce stored server-side. Both layers must pass: signature prevents tampering, nonce prevents CSRF and state replay |
 | Admin key | Stored as `HMAC(key, AUTH_KEY_HMAC_SECRET)`, compared constant-time; hash pre-computed at startup. All admin endpoints rate-limited at 20 RPM per IP |
 | Rate limiting | Per-IP (configurable RPM) + per-account (10 RPM) on login; 20 RPM per IP on admin endpoints. In-memory — effective for single-instance deployments |
@@ -212,6 +252,9 @@ ES256 provides stronger security with significantly less CPU cost at signing tim
 | OAuth account linking | Not automatic — requires authenticated link flow to prevent email-based account takeover |
 | 5xx error responses | Internal error details never sent to the client — logged server-side only |
 | OpenAPI/Swagger | Disabled in `prod` profile |
+| Session cookie | `platform_session` — HttpOnly, Secure, SameSite=Lax; set on auth responses, cleared on logout; configurable domain for cross-subdomain sharing |
+| Forward auth | `GET /auth/verify` — validates cookie or Bearer token, returns user identity headers for the reverse proxy to forward |
+| Security headers | `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `CSP: default-src 'none'`, `HSTS: max-age=31536000`, `Referrer-Policy: strict-origin-when-cross-origin` on all responses |
 | Login error messages | Generic "Invalid email or password" for all failures — does not reveal whether email is registered or OAuth-only |
 | Deleted-user guard | `POST /auth/token` rejects a valid code if the account was deleted after code issuance |
 | Audit logging | Critical events (login success/failure, account deletion, token exchange, admin auth failures) logged at INFO with an `AUDIT` prefix |
@@ -220,12 +263,16 @@ ES256 provides stronger security with significantly less CPU cost at signing tim
 
 - **`/auth/me` and `/auth/account` are app-agnostic** — they return the global user identity and do not enforce `aud`. This is intentional: these routes serve any valid JWT regardless of which app issued it. If you need per-app identity binding on these routes, pass `X-App-Id` and validate `aud` in your own middleware.
 - **Redirect URI normalization** — URIs are compared after lowercasing the host, stripping default ports (`:443` for https, `:80` for http), and trimming trailing slashes. `https://app/cb` and `https://app/cb/` are treated as the same URI.
-- **JWT lifetime (7 days)** and **bcrypt cost 10** are policy choices tuned for a personal low-resource server. Tighten `AUTH_JWT_EXPIRY_SECONDS` or bcrypt cost if your threat model requires it.
+- **JWT lifetime (15 minutes)** with **7-day refresh tokens** provides a good balance between security and usability. Adjust `AUTH_JWT_EXPIRY_SECONDS` and `AUTH_REFRESH_TOKEN_EXPIRY_SECONDS` if needed.
 - **No PKCE** — acceptable for confidential clients (server-to-server). Add PKCE before supporting mobile or SPA public clients.
 - **OAuth state size** — grows with long `redirect_uri` values. All major providers tolerate the current size; no action needed unless you hit provider limits.
 - **SQLite key material** — the EC private key and user data live in the DB file. Protect it with filesystem permissions, encrypted volumes, and off-site backups.
-- **TLS, HSTS, CORS** — terminate TLS at the reverse proxy; set `AUTH_CORS_ORIGINS` explicitly in prod (default is empty — not `*`); add HSTS at the proxy.
+- **TLS, HSTS, CORS** — terminate TLS at the reverse proxy; set `AUTH_CORS_ORIGINS` explicitly in prod (default is empty — not `*`). HSTS is set at the application level via `SecurityHeadersFilter` (max-age=1 year, includeSubDomains).
 - **Dependency CVEs** — no automated scanner is configured in-repo. Consider adding Dependabot or OSV-Scanner to the CI pipeline.
+- **Stateless logout** — `POST /auth/logout` clears the `platform_session` cookie but does not revoke refresh tokens or invalidate access JWTs. Access tokens expire in 15 minutes. On compromise: rotate `AUTH_TOKEN_PEPPER` (invalidates refresh tokens) and wipe `ec_keys` table (invalidates all JWTs; new key pair generated on next boot).
+- **Single-instance rate limiter and nonce store** — in-memory; not shared across instances. Use sticky sessions or Redis if scaling horizontally.
+- **JWT contains PII** — `email` is in the payload. Consuming services should avoid logging raw tokens.
+- **Health/metrics endpoints** (`/q/health`, `/q/metrics`) — ensure your reverse proxy does not expose these publicly if needed.
 
 ## Migrating consuming services from HS256
 
