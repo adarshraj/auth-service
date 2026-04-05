@@ -7,9 +7,12 @@ import com.authservice.api.dto.MfaConfirmRequest
 import com.authservice.api.dto.MfaDisableRequest
 import com.authservice.api.dto.MfaSetupResponse
 import com.authservice.api.dto.MfaVerifyRequest
+import com.authservice.api.dto.PasswordChangeRequest
 import com.authservice.api.dto.RegisterRequest
 import com.authservice.api.dto.UserResponse
 import com.authservice.domain.AppRepository
+import com.authservice.domain.AuthSessionEntity
+import com.authservice.domain.AuthSessionRepository
 import com.authservice.domain.OAuthCodeEntity
 import com.authservice.domain.OAuthCodeRepository
 import com.authservice.security.CallerContext
@@ -42,6 +45,7 @@ import jakarta.ws.rs.WebApplicationException
 import jakarta.ws.rs.container.ContainerRequestContext
 import jakarta.ws.rs.core.Context
 import jakarta.ws.rs.core.MediaType
+import jakarta.ws.rs.core.NewCookie
 import jakarta.ws.rs.core.Response
 import jakarta.ws.rs.core.UriBuilder
 import org.eclipse.microprofile.config.inject.ConfigProperty
@@ -64,6 +68,7 @@ class AuthResource @Inject constructor(
     private val rateLimiter: RateLimiter,
     private val appRepository: AppRepository,
     private val oauthCodeRepository: OAuthCodeRepository,
+    private val authSessionRepository: AuthSessionRepository,
     private val nonceStore: OAuthNonceStore,
     private val mfaNonceStore: MfaNonceStore,
     private val totpService: TotpService,
@@ -71,8 +76,12 @@ class AuthResource @Inject constructor(
     @ConfigProperty(name = "auth.state-hmac-secret") private val stateHmacSecret: String,
     @ConfigProperty(name = "auth.token-pepper") private val tokenPepper: String,
     @ConfigProperty(name = "auth.mfa-hmac-secret") private val mfaHmacSecret: String,
+    @ConfigProperty(name = "auth.session.ttl-seconds", defaultValue = "604800") private val sessionTtlSeconds: Long,
+    @ConfigProperty(name = "auth.session.cookie-secure", defaultValue = "false") private val sessionCookieSecure: Boolean,
+    @ConfigProperty(name = "auth.session.cookie-domain") private val sessionCookieDomain: java.util.Optional<String>,
 ) {
     companion object {
+        const val SESSION_COOKIE_NAME = "auth_session"
         private val log: Logger = Logger.getLogger(AuthResource::class.java)
         private val secureRandom = SecureRandom()
         private const val CODE_TTL_SECONDS = 60L
@@ -82,19 +91,33 @@ class AuthResource @Inject constructor(
         private const val MFA_TOKEN_TTL_SECONDS = 300L
         // Per-userId rate limit for MFA verification — prevents brute force on 6-digit codes
         private const val MFA_VERIFY_RPM = 5
+        // Must match the pattern enforced at app registration (AppDtos.CreateAppRequest.id).
+        // Prevents newline/control-char injection into JWT aud and OAuth state payload.
+        private val APP_ID_PATTERN = Regex("^[a-z0-9_-]{1,64}$")
+    }
+
+    /** Validate the X-App-Id request header format; returns the value or null. */
+    private fun validateAppIdHeader(appId: String?): String? {
+        if (appId == null) return null
+        if (!APP_ID_PATTERN.matches(appId)) {
+            throw BadRequestException("Invalid X-App-Id format")
+        }
+        return appId
     }
 
     // ── Register ──────────────────────────────────────────────────────────────
 
     @POST
     @Path("/register")
+    @Transactional
     @Operation(summary = "Register a new user account")
     fun register(
         @Valid body: RegisterRequest,
-        @HeaderParam("X-App-Id") appId: String?,
+        @HeaderParam("X-App-Id") appIdHeader: String?,
         @Context ctx: ContainerRequestContext,
     ): Response {
         checkRateLimit(ctx)
+        val appId = validateAppIdHeader(appIdHeader)
         val user = userService.register(
             email = body.email,
             password = body.password,
@@ -103,20 +126,24 @@ class AuthResource @Inject constructor(
         )
         val role = appId?.let { userService.getRole(user.id, it) }
         val token = jwtService.sign(user.id, user.email, appId, role)
-        return Response.status(201).entity(AuthResponse(token, user.toResponse())).build()
+        return Response.status(201).entity(AuthResponse(token, user.toResponse()))
+            .cookie(issueSessionCookie(user.id))
+            .build()
     }
 
     // ── Login ─────────────────────────────────────────────────────────────────
 
     @POST
     @Path("/login")
+    @Transactional
     @Operation(summary = "Login with email and password; returns a JWT or MFA challenge")
     fun login(
         @Valid body: LoginRequest,
-        @HeaderParam("X-App-Id") appId: String?,
+        @HeaderParam("X-App-Id") appIdHeader: String?,
         @Context ctx: ContainerRequestContext,
     ): Response {
         checkRateLimit(ctx)
+        val appId = validateAppIdHeader(appIdHeader)
         // Per-account limit: catches distributed brute force that rotates IPs to bypass per-IP limit
         checkRateLimit("auth:account:${body.email.lowercase().trim()}", PER_ACCOUNT_RPM)
         val user = userService.login(body.email, body.password, appId)
@@ -129,7 +156,9 @@ class AuthResource @Inject constructor(
 
         val role = appId?.let { userService.getRole(user.id, it) }
         val token = jwtService.sign(user.id, user.email, appId, role)
-        return Response.ok(AuthResponse(token, user.toResponse())).build()
+        return Response.ok(AuthResponse(token, user.toResponse()))
+            .cookie(issueSessionCookie(user.id))
+            .build()
     }
 
     // ── MFA challenge exchange (OAuth redirect flow) ──────────────────────────
@@ -155,15 +184,16 @@ class AuthResource @Inject constructor(
 
     @POST
     @Path("/mfa/verify")
+    @Transactional
     @Operation(summary = "Complete login by verifying a TOTP code or backup code")
     fun mfaVerify(
         @Valid body: MfaVerifyRequest,
         @Context ctx: ContainerRequestContext,
-    ): AuthResponse {
+    ): Response {
         checkRateLimit(ctx)
         val (userId, email, appId) = parseMfaToken(body.mfaToken)
         // Per-userId rate limit — prevents distributed brute force on 6-digit codes
-        checkRateLimit("mfa:user:$userId", MFA_VERIFY_RPM)
+        checkRateLimit("mfa:verify:$userId", MFA_VERIFY_RPM)
 
         val secret = userService.getMfaSecret(userId)
             ?: throw BadRequestException("MFA not configured")
@@ -180,7 +210,9 @@ class AuthResource @Inject constructor(
         val role = appId?.let { userService.getRole(userId, it) }
         val token = jwtService.sign(userId, email, appId, role)
         val user = userService.getById(userId)
-        return AuthResponse(token, user.toResponse())
+        return Response.ok(AuthResponse(token, user.toResponse()))
+            .cookie(issueSessionCookie(userId))
+            .build()
     }
 
     // ── MFA setup (authenticated users only) ─────────────────────────────────
@@ -207,7 +239,7 @@ class AuthResource @Inject constructor(
     ): Response {
         val caller = ctx.getProperty(JwtFilter.PROP_CALLER) as? CallerContext
             ?: throw NotAuthorizedException("Authentication required", "Bearer")
-        checkRateLimit("mfa:user:${caller.userId}", MFA_VERIFY_RPM)
+        checkRateLimit("mfa:confirm:${caller.userId}", MFA_VERIFY_RPM)
         val secret = userService.getMfaSecret(caller.userId)
             ?: throw BadRequestException("MFA setup not started")
         if (!totpService.verify(secret, body.code)) {
@@ -226,6 +258,9 @@ class AuthResource @Inject constructor(
     ): Response {
         val caller = ctx.getProperty(JwtFilter.PROP_CALLER) as? CallerContext
             ?: throw NotAuthorizedException("Authentication required", "Bearer")
+        // Per-userId rate limit — prevents an attacker with a stolen JWT from brute-forcing
+        // the TOTP code to turn MFA off.
+        checkRateLimit("mfa:disable:${caller.userId}", MFA_VERIFY_RPM)
         val secret = userService.getMfaSecret(caller.userId)
             ?: throw BadRequestException("MFA is not configured for this account")
         if (!userService.isMfaEnabled(caller.userId)) {
@@ -245,9 +280,17 @@ class AuthResource @Inject constructor(
     @POST
     @Path("/logout")
     @Consumes(MediaType.WILDCARD)
-    @Operation(summary = "Logout (stateless — client drops the token)")
-    fun logout(): Response =
-        Response.ok(mapOf("message" to "Logged out")).build()
+    @Transactional
+    @Operation(summary = "Logout — revokes the SSO session cookie; the client must also drop its JWT")
+    fun logout(@Context ctx: ContainerRequestContext): Response {
+        // Delete the server-side session row so the cookie can't be replayed
+        ctx.cookies[SESSION_COOKIE_NAME]?.value?.let { raw ->
+            authSessionRepository.deleteByHashedId(Hmac.sha256(raw, tokenPepper))
+        }
+        return Response.ok(mapOf("message" to "Logged out"))
+            .cookie(buildClearedSessionCookie())
+            .build()
+    }
 
     // ── Me ────────────────────────────────────────────────────────────────────
 
@@ -258,6 +301,24 @@ class AuthResource @Inject constructor(
         val caller = ctx.getProperty(JwtFilter.PROP_CALLER) as? CallerContext
             ?: throw NotAuthorizedException("Authentication required", "Bearer")
         return userService.getById(caller.userId).toResponse()
+    }
+
+    // ── Change password ───────────────────────────────────────────────────────
+
+    @POST
+    @Path("/password")
+    @Operation(summary = "Change own password (requires Bearer JWT + current password)")
+    fun changePassword(
+        @Valid body: PasswordChangeRequest,
+        @Context ctx: ContainerRequestContext,
+    ): Response {
+        val caller = ctx.getProperty(JwtFilter.PROP_CALLER) as? CallerContext
+            ?: throw NotAuthorizedException("Authentication required", "Bearer")
+        // Per-user rate limit — bounds an attacker who has a stolen JWT trying to guess the
+        // current password in order to rotate it.
+        checkRateLimit("password:change:${caller.userId}", MFA_VERIFY_RPM)
+        userService.changePassword(caller.userId, body.currentPassword, body.newPassword)
+        return Response.ok(mapOf("message" to "Password changed")).build()
     }
 
     // ── Delete account ────────────────────────────────────────────────────────
@@ -279,9 +340,10 @@ class AuthResource @Inject constructor(
     @Operation(summary = "Redirect to OAuth provider (google or github)")
     fun oauthRedirect(
         @PathParam("provider") provider: String,
-        @HeaderParam("X-App-Id") appId: String?,
+        @HeaderParam("X-App-Id") appIdHeader: String?,
         @QueryParam("redirect_uri") redirectUri: String?,
     ): Response {
+        val appId = validateAppIdHeader(appIdHeader)
         if (redirectUri != null) {
             validateRedirectUri(redirectUri, appId)
         }
@@ -335,9 +397,11 @@ class AuthResource @Inject constructor(
                 // via POST /auth/mfa/challenge. This avoids exposing the mfaToken in the URL
                 // (browser history, Referer headers, proxy logs).
                 val mfaCode = userService.createAuthToken(user.id, "mfa_challenge", expiresInHours = 0, expiresInSeconds = CODE_TTL_SECONDS, appId = appId)
+                // Place mfa_required/mfa_code in the URL fragment, not the query.
+                // Fragments are never sent to servers (no proxy logs, no Referer leak to third-party
+                // resources loaded by the landing page) — only browser history retains them.
                 val location = UriBuilder.fromUri(redirectUri)
-                    .queryParam("mfa_required", "true")
-                    .queryParam("mfa_code", mfaCode)
+                    .fragment("mfa_required=true&mfa_code=$mfaCode")
                     .build()
                 Response.temporaryRedirect(location).build()
             } else {
@@ -350,11 +414,13 @@ class AuthResource @Inject constructor(
             val authCode = issueOAuthCode(user.id, user.email, appId)
             // UriBuilder handles existing query params (appends & when needed) and percent-encodes values
             val location = UriBuilder.fromUri(redirectUri).queryParam("code", authCode).build()
-            Response.temporaryRedirect(location).build()
+            Response.temporaryRedirect(location).cookie(issueSessionCookie(user.id)).build()
         } else {
             val role = appId?.let { userService.getRole(user.id, it) }
             val token = jwtService.sign(user.id, user.email, appId, role)
-            Response.ok(AuthResponse(token, user.toResponse())).build()
+            Response.ok(AuthResponse(token, user.toResponse()))
+                .cookie(issueSessionCookie(user.id))
+                .build()
         }
     }
 
@@ -378,6 +444,8 @@ class AuthResource @Inject constructor(
         val user = try { userService.getById(entity.userId) }
             catch (e: jakarta.ws.rs.NotFoundException) { throw BadRequestException("Invalid auth code") }
 
+        userService.requireAppAccess(entity.userId, entity.appId)
+
         // If MFA is enabled, return a challenge instead of a JWT
         if (userService.isMfaEnabled(entity.userId)) {
             val mfaToken = buildMfaToken(entity.userId, entity.email, entity.appId)
@@ -387,8 +455,90 @@ class AuthResource @Inject constructor(
         val role = entity.appId?.let { userService.getRole(entity.userId, it) }
         val token = jwtService.sign(entity.userId, entity.email, entity.appId, role)
         log.infof("AUDIT token_exchanged userId=%s app=%s", entity.userId, entity.appId ?: "none")
-        return Response.ok(AuthResponse(token, user.toResponse())).build()
+        return Response.ok(AuthResponse(token, user.toResponse()))
+            .cookie(issueSessionCookie(entity.userId))
+            .build()
     }
+
+    // ── SSO session cookie ────────────────────────────────────────────────────
+
+    /**
+     * Exchange the SSO cookie for a one-time OAuth code bound to `app_id`. Lets a user who
+     * is already signed in on the auth-service domain log into another app without re-entering
+     * credentials or going through the OAuth provider again.
+     *
+     * Requires a registered redirect_uri for the target app. If no valid session cookie is
+     * present, returns 401 — the client app is expected to fall back to the full login flow.
+     */
+    @GET
+    @Path("/sso")
+    @Transactional
+    @Operation(summary = "Exchange the SSO session cookie for a one-time code; redirects to redirect_uri?code=")
+    fun sso(
+        @HeaderParam("X-App-Id") appIdHeader: String?,
+        @QueryParam("app_id") appIdQuery: String?,
+        @QueryParam("redirect_uri") redirectUri: String?,
+        @Context ctx: ContainerRequestContext,
+    ): Response {
+        val appId = validateAppIdHeader(appIdHeader ?: appIdQuery)
+            ?: throw BadRequestException("app_id is required")
+        if (redirectUri.isNullOrBlank()) throw BadRequestException("redirect_uri is required")
+        validateRedirectUri(redirectUri, appId)
+
+        val rawCookie = ctx.cookies[SESSION_COOKIE_NAME]?.value
+            ?: throw NotAuthorizedException("No active session", "Cookie")
+        val session = authSessionRepository.findValid(Hmac.sha256(rawCookie, tokenPepper), Instant.now())
+            ?: throw NotAuthorizedException("Session expired or invalid", "Cookie")
+
+        val user = userService.getById(session.userId)
+        userService.requireAppAccess(user.id, appId)
+        val authCode = issueOAuthCode(user.id, user.email, appId)
+        log.infof("AUDIT sso_issued userId=%s app=%s", user.id, appId)
+        val location = UriBuilder.fromUri(redirectUri).queryParam("code", authCode).build()
+        return Response.temporaryRedirect(location).build()
+    }
+
+    /** Create a server-side session row and return the raw cookie value to set on the client. */
+    private fun createSession(userId: String): String {
+        val rawId = ByteArray(32).also { secureRandom.nextBytes(it) }
+            .joinToString("") { "%02x".format(it) }
+        val entity = AuthSessionEntity().apply {
+            id = Hmac.sha256(rawId, tokenPepper)
+            this.userId = userId
+            expiresAt = Instant.now().plusSeconds(sessionTtlSeconds)
+            createdAt = Instant.now()
+        }
+        authSessionRepository.persist(entity)
+        return rawId
+    }
+
+    /** Build a Set-Cookie header for a freshly created session. */
+    private fun buildSessionCookie(rawValue: String): NewCookie =
+        NewCookie.Builder(SESSION_COOKIE_NAME)
+            .value(rawValue)
+            .path("/")
+            .domain(sessionCookieDomain.orElse(null)?.takeIf { it.isNotBlank() })
+            .maxAge(sessionTtlSeconds.toInt())
+            .httpOnly(true)
+            .secure(sessionCookieSecure)
+            .sameSite(NewCookie.SameSite.STRICT)
+            .build()
+
+    /** Build a Set-Cookie header that clears the session cookie. */
+    private fun buildClearedSessionCookie(): NewCookie =
+        NewCookie.Builder(SESSION_COOKIE_NAME)
+            .value("")
+            .path("/")
+            .domain(sessionCookieDomain.orElse(null)?.takeIf { it.isNotBlank() })
+            .maxAge(0)
+            .httpOnly(true)
+            .secure(sessionCookieSecure)
+            .sameSite(NewCookie.SameSite.STRICT)
+            .build()
+
+    /** Issue a session for a freshly-authenticated user and return its Set-Cookie. */
+    private fun issueSessionCookie(userId: String): NewCookie =
+        buildSessionCookie(createSession(userId))
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -420,11 +570,14 @@ class AuthResource @Inject constructor(
         return try {
             val decoded = String(java.util.Base64.getUrlDecoder().decode(payload))
             val parts = decoded.split("\n")
-            if (parts.size < 5) throw BadRequestException("Invalid MFA token")
-            val nonce = parts[3]
-            if (!mfaNonceStore.consume(nonce)) throw BadRequestException("MFA token already used or expired — please login again")
+            if (parts.size != 5) throw BadRequestException("Invalid MFA token")
+            // Check expiry BEFORE consuming the nonce — an expired token should not burn the
+            // nonce slot (harmless today since the store has its own TTL, but avoids the surprising
+            // UX where a stale token returned by the back button permanently kills the session).
             val expiry = parts[4].toLongOrNull() ?: throw BadRequestException("Invalid MFA token")
             if (System.currentTimeMillis() / 1000 > expiry) throw BadRequestException("MFA token expired — please login again")
+            val nonce = parts[3]
+            if (!mfaNonceStore.consume(nonce)) throw BadRequestException("MFA token already used or expired — please login again")
             Triple(parts[0], parts[1], parts[2].takeIf { it.isNotBlank() })
         } catch (e: IllegalArgumentException) {
             throw BadRequestException("Invalid MFA token")
@@ -542,6 +695,9 @@ class AuthResource @Inject constructor(
      * - Lowercase scheme and host
      * - Strip default ports (443 for https, 80 for http)
      * - Strip trailing slash from path
+     *
+     * Query strings and fragments are intentionally ignored — only scheme://host:port/path is
+     * compared. Registered redirect URIs must not rely on query params or fragments for identity.
      */
     private fun normalizeRedirectUri(uri: URI): String {
         val scheme = uri.scheme.lowercase()

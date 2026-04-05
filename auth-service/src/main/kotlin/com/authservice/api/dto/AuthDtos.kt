@@ -10,13 +10,18 @@ data class RegisterRequest(
     @field:NotBlank @field:Email val email: String = "",
     // password is intentionally optional — supports OAuth-only accounts created via the OAuth flow.
     // Callers registering a password account must supply a value; bcrypt validation is in PasswordService.
-    @field:Size(min = 8, message = "Password must be at least 8 characters") val password: String? = null,
+    @field:Size(min = 8, max = 128, message = "Password must be between 8 and 128 characters") val password: String? = null,
     val name: String? = null,
 )
 
 data class LoginRequest(
     @field:NotBlank @field:Email val email: String = "",
-    @field:NotBlank val password: String = "",
+    @field:NotBlank @field:Size(max = 128) val password: String = "",
+)
+
+data class PasswordChangeRequest(
+    @field:NotBlank val currentPassword: String = "",
+    @field:NotBlank @field:Size(min = 8, max = 128, message = "Password must be between 8 and 128 characters") val newPassword: String = "",
 )
 
 // ── Responses ────────────────────────────────────────────────────────────────

@@ -48,11 +48,14 @@ class TotpService {
         return false
     }
 
-    /** Generate recovery codes (8 codes, 8 chars each). */
+    /**
+     * Generate recovery codes: 8 codes × 10 base32 chars = 50 bits of entropy each.
+     * Formatted as `xxxxx-xxxxx` for readability. Stored as HMAC hashes by the caller.
+     */
     fun generateRecoveryCodes(): List<String> {
-        val chars = "abcdefghijklmnopqrstuvwxyz0123456789"
         return (1..8).map {
-            (1..8).map { chars[secureRandom.nextInt(chars.length)] }.joinToString("")
+            val raw = (1..10).map { BASE32_CHARS[secureRandom.nextInt(BASE32_CHARS.length)] }.joinToString("").lowercase()
+            "${raw.substring(0, 5)}-${raw.substring(5, 10)}"
         }
     }
 
@@ -106,7 +109,7 @@ class TotpService {
         var bitsLeft = 0
         for (ch in data) {
             val value = BASE32_CHARS.indexOf(ch)
-            if (value < 0) continue
+            if (value < 0) throw IllegalArgumentException("Invalid base32 character: $ch")
             buffer = (buffer shl 5) or value
             bitsLeft += 5
             if (bitsLeft >= 8) {

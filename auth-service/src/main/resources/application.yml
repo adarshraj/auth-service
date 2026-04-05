@@ -33,6 +33,16 @@ auth:
   jwt:
     # Token expiry in seconds. Default 7 days.
     expiry-seconds: ${AUTH_JWT_EXPIRY_SECONDS:604800}
+  session:
+    # SSO cookie TTL in seconds. Default 7 days (matches JWT).
+    ttl-seconds: ${AUTH_SESSION_TTL_SECONDS:604800}
+    # Set to true in prod (requires HTTPS). Browsers exempt localhost from this requirement
+    # in dev, so leave false locally.
+    cookie-secure: ${AUTH_SESSION_COOKIE_SECURE:false}
+    # Optional. In prod scope cookie to your parent domain (e.g. "yourdomain.com") so all
+    # subdomains (auth.yourdomain.com, app-a.yourdomain.com) share it. Leave empty for
+    # localhost — browsers scope to the origin automatically.
+    cookie-domain: ${AUTH_SESSION_COOKIE_DOMAIN:}
   admin-key: ${AUTH_ADMIN_KEY:}
   # HMAC-SHA256 secrets — three separate secrets to limit blast radius if one leaks.
   # auth.key-hmac-secret  → admin key comparison (ApiKeyHasher)

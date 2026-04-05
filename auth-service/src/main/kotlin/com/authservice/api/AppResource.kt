@@ -132,7 +132,7 @@ class AppResource @Inject constructor(
         @HeaderParam("X-Admin-Key") key: String?,
         @PathParam("appId") appId: String,
         @PathParam("userId") userId: String,
-        body: GrantAccessRequest?,
+        @Valid body: GrantAccessRequest?,
     ): Response {
         checkAdmin(key)
         userService.grantAccess(userId, appId, body?.role ?: "user")

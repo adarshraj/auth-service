@@ -29,7 +29,7 @@ class JwtFilter @Inject constructor(
         const val PROP_CALLER = "auth.caller"
 
         // Paths that require a valid JWT
-        private val PROTECTED = setOf("/auth/me", "/auth/account", "/auth/mfa/setup", "/auth/mfa/confirm", "/auth/mfa/disable")
+        private val PROTECTED = setOf("/auth/me", "/auth/account", "/auth/password", "/auth/mfa/setup", "/auth/mfa/confirm", "/auth/mfa/disable")
     }
 
     override fun filter(ctx: ContainerRequestContext) {
@@ -49,7 +49,11 @@ class JwtFilter @Inject constructor(
         }
 
         val token = header.removePrefix("Bearer ").trim()
-        val claims = jwtService.verify(token)
+        // If the caller sends X-App-Id, enforce it as the expected audience — the token must have
+        // been issued for that app. This is opt-in because these endpoints (/auth/me, /auth/account,
+        // /auth/password, /auth/mfa/*) are user-identity scoped and work with app-agnostic tokens too.
+        val expectedAud = ctx.getHeaderString("X-App-Id")?.takeIf { it.isNotBlank() }
+        val claims = jwtService.verify(token, expectedAud)
         if (claims == null) {
             log.debugf("Invalid JWT for path=%s", path)
             abort(ctx, "Invalid or expired token")

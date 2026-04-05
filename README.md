@@ -13,6 +13,7 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 - `aud` claim scoped to `appId` — a token issued for one app is rejected by any other app
 - `groups` claim with the user's app-level role — consuming Quarkus/MP-JWT services can use `@RolesAllowed` directly
 - Optional TOTP-based MFA — users opt-in; existing clients unaffected. Built with JDK crypto only (no external dependencies)
+- SSO across your apps — a successful login sets an `HttpOnly` `auth_session` cookie on the auth-service domain; other apps exchange it for a JWT at `GET /auth/sso` with no password or OAuth hop
 
 ## API
 
@@ -22,9 +23,11 @@ Standalone authentication service for the personal app ecosystem. Runs on port *
 |--------|------|-------------|
 | `POST` | `/auth/register` | Register (email + password); `X-App-Id` header optional |
 | `POST` | `/auth/login` | Login → JWT; `X-App-Id` header optional |
-| `POST` | `/auth/logout` | Stateless — client drops the token |
+| `POST` | `/auth/logout` | Revokes the SSO session cookie (client must also drop its JWT) |
+| `POST` | `/auth/password` | Change password — requires current password (requires JWT) |
 | `GET`  | `/auth/me` | Current user (requires `Authorization: Bearer <token>`) |
 | `DELETE` | `/auth/account` | Delete own account (requires JWT) |
+| `GET`  | `/auth/sso` | Exchange the SSO cookie for a code; `?app_id=&redirect_uri=` → redirects to `redirect_uri?code=` |
 | `GET`  | `/auth/oauth/{provider}` | Redirect to Google or GitHub; optional `?redirect_uri=` and `X-App-Id` |
 | `GET`  | `/auth/oauth/callback` | OAuth callback — issues a one-time code, redirects to `redirect_uri?code=` |
 | `POST` | `/auth/token` | Exchange one-time code for a JWT (`application/x-www-form-urlencoded`, field: `code`) |
@@ -75,7 +78,7 @@ MFA is enforced across all login paths — password login, OAuth (JSON and redir
    ```json
    { "mfaRequired": true, "mfaToken": "..." }
    ```
-   For the OAuth redirect flow, the redirect URL becomes `?mfa_required=true&mfa_token=...` instead of `?code=...`.
+   For the OAuth redirect flow, the redirect URL fragment becomes `#mfa_required=true&mfa_code=...` instead of `?code=...`.
 2. Prompt the user for their 6-digit TOTP code (or a backup code), then call:
    ```
    POST /auth/mfa/verify
@@ -111,7 +114,7 @@ The JWT is never placed in a URL or fragment — it only travels over the back-c
 
 **`redirect_uri` must be registered** for the app via `POST /auth/apps` (`redirectUris` field) before the flow will work. Redirect URIs are compared by `scheme://host:port/path` only — query strings and fragments are ignored during validation.
 
-**If the user has MFA enabled**, step 2 redirects to `https://yourapp.com/callback?mfa_required=true&mfa_code=<code>` instead. Your server exchanges the code for an MFA challenge token, then completes the TOTP step:
+**If the user has MFA enabled**, step 2 redirects to `https://yourapp.com/callback#mfa_required=true&mfa_code=<code>` instead (in the URL fragment — never sent to servers, so not leaked via Referer or proxy logs). Client-side JS reads `window.location.hash`, then your server exchanges the code for an MFA challenge token, then completes the TOTP step:
 ```
 POST /auth/mfa/challenge
 Content-Type: application/x-www-form-urlencoded
@@ -119,6 +122,29 @@ Content-Type: application/x-www-form-urlencoded
 code=<mfa-code>
 ```
 Response is `{ mfaRequired, mfaToken }`. Then complete MFA via `POST /auth/mfa/verify`.
+
+## SSO across your apps
+
+Every successful auth (`/auth/login`, `/auth/register`, `/auth/mfa/verify`, `/auth/token`, OAuth callback) sets an `auth_session` cookie on the auth-service domain: `HttpOnly`, `SameSite=Strict`, `Max-Age=AUTH_SESSION_TTL_SECONDS` (default 7 days). The raw id lives only in the cookie; the server stores `HMAC(raw, token-pepper)` in `auth_sessions`.
+
+**To log a user into a second app without a password prompt:**
+
+1. From app B, redirect the browser to:
+   ```
+   GET https://auth.yourdomain.com/auth/sso?app_id=app-b&redirect_uri=https://app-b.yourdomain.com/cb
+   ```
+2. The browser sends `auth_session` (same-site as long as both apps share the parent domain). auth-service validates the session, enforces `requires_explicit_access` for `app-b`, issues a one-time code, and 302s to `redirect_uri?code=<code>`.
+3. App B exchanges the code via `POST /auth/token` — same as the OAuth flow.
+
+Fallbacks:
+- No cookie / expired → `401 "No active session"`. Kick off the full login or OAuth flow.
+- No access to the target app → `403 "You do not have access to this application"`.
+
+**Scoping:**
+- **Local dev** — leave `AUTH_SESSION_COOKIE_DOMAIN` empty; the browser scopes the cookie to the auth-service origin and sends it to all `localhost` ports (they're same-site).
+- **Prod** — set `AUTH_SESSION_COOKIE_DOMAIN=yourdomain.com` and `AUTH_SESSION_COOKIE_SECURE=true`. Apps must live on sibling subdomains (`auth.yourdomain.com`, `app-a.yourdomain.com`, …) for the cookie to travel on the cross-subdomain redirect under `SameSite=Strict`.
+
+**Logout.** `POST /auth/logout` deletes the session row matching the current cookie and clears the cookie on that client only. Sessions on other devices remain valid until their TTL expires (no "log out everywhere").
 
 ## Verifying tokens in consuming services
 
@@ -242,6 +268,9 @@ On first register/OAuth-login into a `requiresExplicitAccess: true` app, access 
 | `AUTH_MFA_HMAC_SECRET` | Prod | HMAC secret for signing MFA challenge tokens (min 32 chars) |
 | `AUTH_BASE_URL` | For OAuth | Base URL for OAuth callback redirect (e.g. `https://auth.example.com`) |
 | `AUTH_JWT_EXPIRY_SECONDS` | No | Token TTL in seconds (default: 604800 = 7 days) |
+| `AUTH_SESSION_TTL_SECONDS` | No | SSO cookie TTL in seconds (default: 604800 = 7 days) |
+| `AUTH_SESSION_COOKIE_SECURE` | Prod | `true` to set the `Secure` cookie flag (default: false; localhost is exempt) |
+| `AUTH_SESSION_COOKIE_DOMAIN` | Prod | Parent domain for the cookie (e.g. `yourdomain.com`) so all subdomains share it; leave empty for localhost |
 | `AUTH_DB_FILE` | No | Path to SQLite DB file (default: `./authservice.db`) |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | For Google OAuth | |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | For GitHub OAuth | |

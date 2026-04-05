@@ -174,6 +174,32 @@ class UserService @Inject constructor(
     fun getById(userId: String): UserView =
         (userRepository.findById(userId) ?: throw NotFoundException("User not found")).toView()
 
+    /**
+     * Same gate as [login] / [findOrCreateByOAuth]: required before minting OAuth codes or JWTs
+     * for an app (SSO, token exchange) so a session or stolen code cannot bypass explicit access.
+     */
+    fun requireAppAccess(userId: String, appId: String?) {
+        val user = userRepository.findById(userId) ?: throw NotFoundException("User not found")
+        checkAppAccess(user, appId)
+    }
+
+    @Transactional
+    fun changePassword(userId: String, currentPassword: String, newPassword: String) {
+        val user = userRepository.findById(userId) ?: throw NotFoundException("User not found")
+        val currentHash = user.passwordHash
+            ?: throw BadRequestException("This account has no password set (OAuth-only)")
+        if (!passwordService.verify(currentPassword, currentHash)) {
+            log.infof("AUDIT password_change_failed reason=bad_password userId=%s", userId)
+            throw NotAuthorizedException("Current password is incorrect", "Bearer")
+        }
+        if (passwordService.verify(newPassword, currentHash)) {
+            throw BadRequestException("New password must be different from the current password")
+        }
+        user.passwordHash = passwordService.hash(newPassword)
+        user.updatedAt = Instant.now()
+        log.infof("AUDIT password_changed userId=%s", userId)
+    }
+
     @Transactional
     fun deleteAccount(userId: String) {
         val user = userRepository.findById(userId) ?: throw NotFoundException("User not found")
@@ -301,7 +327,10 @@ class UserService @Inject constructor(
 
     private fun checkAppAccess(user: UserEntity, appId: String?) {
         if (appId == null) return
-        val app = appRepository.findById(appId) ?: return
+        // Fail closed: an unknown appId must not silently mint a token bearing that aud.
+        // If the app row was deleted or mistyped, the access gate would otherwise be bypassed.
+        val app = appRepository.findById(appId)
+            ?: throw BadRequestException("Unknown app: $appId")
         if (app.requiresExplicitAccess && !accessRepository.hasAccess(user.id, appId)) {
             throw ForbiddenException("You do not have access to this application")
         }

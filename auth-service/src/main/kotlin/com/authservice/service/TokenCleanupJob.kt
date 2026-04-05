@@ -1,5 +1,6 @@
 package com.authservice.service
 
+import com.authservice.domain.AuthSessionRepository
 import com.authservice.domain.AuthTokenRepository
 import com.authservice.domain.OAuthCodeRepository
 import io.quarkus.scheduler.Scheduled
@@ -15,6 +16,7 @@ import java.time.temporal.ChronoUnit
 class TokenCleanupJob @Inject constructor(
     private val authTokenRepository: AuthTokenRepository,
     private val oauthCodeRepository: OAuthCodeRepository,
+    private val authSessionRepository: AuthSessionRepository,
 ) {
     companion object {
         private val log: Logger = Logger.getLogger(TokenCleanupJob::class.java)
@@ -31,5 +33,8 @@ class TokenCleanupJob @Inject constructor(
         val codeCutoff = Instant.now().minus(1, ChronoUnit.DAYS)
         val deletedCodes = oauthCodeRepository.deleteExpiredBefore(codeCutoff)
         if (deletedCodes > 0) log.infof("Purged %d expired oauth codes", deletedCodes)
+
+        val deletedSessions = authSessionRepository.deleteExpiredBefore(Instant.now())
+        if (deletedSessions > 0) log.infof("Purged %d expired auth sessions", deletedSessions)
     }
 }

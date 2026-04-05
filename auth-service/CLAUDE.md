@@ -42,7 +42,7 @@ Layered under `src/main/kotlin/com/authservice/`:
 - **`api/`** — JAX-RS resources (`AuthResource`, `AppResource`, `WellKnownResource`), DTOs, and exception mappers. Resources delegate all logic to services.
 - **`service/`** — Business logic: `UserService` (registration, login, OAuth account linking, access management, auth tokens, MFA), `JwtService` (sign/verify ES256), `EcKeyService` (generate/persist/expose EC P-256 key pair), `PasswordService` (bcrypt), `OAuthService` (Google + GitHub flows), `TotpService` (TOTP generation/verification using JDK crypto), `TokenCleanupJob` (scheduled purge).
 - **`domain/`** — JPA entities and Panache repositories: `UserEntity`, `AppEntity`, `UserAppAccessEntity` (composite PK), `AuthTokenEntity`, `EcKeyEntity`, `OAuthCodeEntity`.
-- **`security/`** — `JwtFilter` (protects `/auth/me`, `/auth/account`, and `/auth/mfa/setup|confirm|disable`), `RateLimiter` (in-memory fixed-window), `OAuthNonceStore` (single-use nonce validation for OAuth CSRF protection), `ApiKeyHasher` (HMAC-SHA256 for admin key), `CallerContext` (request-scoped user identity), `StartupGuard` (validates required secrets on boot).
+- **`security/`** — `JwtFilter` (protects `/auth/me`, `/auth/account`, `/auth/password`, and `/auth/mfa/setup|confirm|disable`), `RateLimiter` (in-memory fixed-window), `OAuthNonceStore` / `MfaNonceStore` (in-memory single-use nonce validation for OAuth-state and MFA-token replay protection), `ApiKeyHasher` (HMAC-SHA256 for admin key), `CallerContext` (request-scoped user identity), `StartupGuard` (validates required secrets on boot).
 - **`config/`** — `RateLimitConfig` and `OAuthConfig` ConfigMapping interfaces.
 
 ### Key flows
@@ -58,7 +58,7 @@ Layered under `src/main/kotlin/com/authservice/`:
 2. 302 to provider → provider redirects to `GET /auth/oauth/callback`
 3. `OAuthService.exchangeCode()` → `UserService.findOrCreateByOAuth()` → issue one-time code → 302 to `redirect_uri?code=<code>`
 4. Client POSTs `POST /auth/token` (form: `code=<code>`) → JWT returned (code valid 60s, single-use)
-5. If MFA enabled: step 3 redirects to `redirect_uri?mfa_required=true&mfa_code=<code>` instead → client exchanges code via `POST /auth/mfa/challenge` (form: `code=<code>`) → receives `MfaChallengeResponse` → completes via `POST /auth/mfa/verify`
+5. If MFA enabled: step 3 redirects to `redirect_uri#mfa_required=true&mfa_code=<code>` instead (fragment, not query — so it's not sent to servers/proxies/Referer) → client-side JS reads `window.location.hash` and exchanges the code via `POST /auth/mfa/challenge` (form: `code=<code>`) → receives `MfaChallengeResponse` → completes via `POST /auth/mfa/verify`
 
 **OAuth (API flow without redirect_uri):** Same as above but callback returns `AuthResponse` or `MfaChallengeResponse` JSON directly.
 
@@ -93,6 +93,7 @@ All three return HTTP 200 in both cases. The presence of `mfaRequired: true` ind
 | V7 | `oauth_codes` | Short-lived one-time codes for the OAuth browser redirect flow (60s TTL) |
 | V8 | `users` (columns) | MFA fields — `mfa_enabled`, `mfa_secret`, `mfa_backup_codes` |
 | V9 | `auth_tokens` (column) | `app_id` — binds token to originating app for MFA challenge flow |
+| V10 | `auth_sessions` | Server-side SSO sessions — HMAC-hashed id, `user_id`, `expires_at` |
 
 ### Admin key security
 
@@ -126,7 +127,12 @@ Login is rate-limited twice: per-IP (global RPM from config) and per-account (ha
 
 Admin endpoints are rate-limited at 20 RPM per IP independently of the auth rate limits.
 
-**Known limitation:** The rate limiter is in-memory (`RateLimiter` uses `ConcurrentHashMap`). In a horizontally-scaled deployment with multiple instances, each instance tracks limits independently — the effective limit per IP is `RPM × instance count`. For single-instance deployments (the intended use case for a personal auth service) this is not a concern. If you scale horizontally, replace with a shared Redis-backed implementation.
+**Known limitation — in-memory security state:** `RateLimiter`, `OAuthNonceStore`, and `MfaNonceStore` all use `ConcurrentHashMap`. In a horizontally-scaled deployment:
+- Rate limits are per-instance → effective limit is `RPM × instance count`.
+- OAuth state and MFA nonces are per-instance → if a request lands on a different instance than the one that issued the state/token, the nonce check fails with "state expired" / "MFA token already used" (random 401s depending on load-balancer routing).
+- Sticky sessions mitigate the nonce issue but not the rate-limit split.
+
+For single-instance deployments (the intended use case for a personal auth service) none of this matters. If you scale horizontally, move all three to a shared Redis-backed implementation.
 
 ### MFA (TOTP)
 
@@ -142,7 +148,7 @@ Optional two-factor authentication using TOTP (RFC 6238). Implemented entirely w
 2. Client calls `POST /auth/mfa/verify` with the `mfaToken` and a TOTP code (or backup code).
 3. Response is the standard `AuthResponse { token, user }`.
 
-**OAuth + MFA:** MFA is enforced across all login paths — password, OAuth JSON callback, and OAuth code exchange (`POST /auth/token`). When a user with MFA enabled completes OAuth, the response is an `MfaChallengeResponse` instead of a JWT. For the redirect flow, the client receives `?mfa_required=true&mfa_token=...` instead of `?code=...`.
+**OAuth + MFA:** MFA is enforced across all login paths — password, OAuth JSON callback, and OAuth code exchange (`POST /auth/token`). When a user with MFA enabled completes OAuth, the response is an `MfaChallengeResponse` instead of a JWT. For the redirect flow, the client receives `#mfa_required=true&mfa_code=...` in the URL fragment (not query) — the client reads `window.location.hash`, exchanges `mfa_code` for the signed `mfaToken` via `POST /auth/mfa/challenge`, then completes via `POST /auth/mfa/verify`.
 
 **MFA challenge token:** HMAC-signed (`base64url(userId\nemail\nappId\nnonce\nexpiry)~hmac`), signed with `auth.mfa-hmac-secret` (dedicated secret, separate from OAuth state and token pepper), 5-minute TTL. Single-use — nonce is registered in `MfaNonceStore` and consumed on verification. Not a JWT — lightweight and single-purpose.
 
@@ -155,6 +161,26 @@ Optional two-factor authentication using TOTP (RFC 6238). Implemented entirely w
 **Backward compatibility:** MFA is fully optional. Users who have not enabled MFA see no change in login behavior — the response is the same `AuthResponse { token, user }`. Clients only need to handle the MFA challenge flow if their users choose to enable MFA.
 
 **MFA secret storage:** The TOTP secret is encrypted with AES-256-GCM using `SHA-256(AUTH_TOKEN_PEPPER)` as the key. Stored as `iv:ciphertext` in base64. A DB dump does not expose the raw TOTP secret. Backup codes are stored as HMAC hashes (not reversible).
+
+### SSO (single sign-on across your apps)
+
+After any successful authentication (`login`, `register`, `mfaVerify`, `oauthCallback` success path, `exchangeToken`), the response carries a `Set-Cookie: auth_session=<opaque>` header. The raw session id lives only in the client cookie; the server stores `HMAC(raw, token-pepper)` in the `auth_sessions` table so a DB dump cannot forge a cookie.
+
+**Cookie attributes:** `HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=AUTH_SESSION_TTL_SECONDS` (default 604800 = 7 days). `Secure` is off by default for localhost dev; set `AUTH_SESSION_COOKIE_SECURE=true` in prod. `Domain` is unset by default (origin-scoped) — in prod set `AUTH_SESSION_COOKIE_DOMAIN=yourdomain.com` so the cookie is sent on all your subdomains.
+
+**SSO exchange — `GET /auth/sso?app_id=<id>&redirect_uri=<uri>`:**
+1. Another app (app B) that wants this user authenticated 302-redirects the browser to `GET /auth/sso?…`.
+2. The browser sends `auth_session` (same-site on shared parent domain). The service looks up the session, runs `requireAppAccess(userId, appId)` (enforces `requires_explicit_access`), mints a one-time OAuth code, and 302s to `redirect_uri?code=<code>`.
+3. App B calls `POST /auth/token` with the code → receives a JWT. No password, no OAuth provider hop.
+4. If the user has no valid session → 401 `"No active session"`. If the user has no access to the app → 403 `"You do not have access to this application"`. Client is expected to fall back to the full login flow.
+
+**Concurrent sessions:** Each successful login inserts a new `auth_sessions` row. `POST /auth/logout` deletes **only** the row matching the current cookie and clears the cookie on that client — other devices remain logged in until their session TTL expires or `TokenCleanupJob` purges them. There is no "log out everywhere" endpoint.
+
+**CSRF surface:** `GET /auth/sso` is a browser redirect and relies on `SameSite=Strict` + the registered `redirect_uri` whitelist as its two defenses. Strict is safe here because the flow is designed to be traversed only from *your own apps* under the shared parent domain (so the cookie still travels on the redirect); a cross-origin attacker's page cannot cause the browser to send the cookie. If you need cross-site SSO (e.g. embedded flows from a domain you don't own), switch to `SameSite=Lax` — at the cost of widening CSRF surface on any state-changing GETs you might add later.
+
+**Password change has no MFA step-up.** `POST /auth/password` requires only a valid JWT + current password; the TOTP code is not re-checked even when MFA is enabled. This matches common stateless-API behaviour but is a product choice you may want to revisit.
+
+**Unrated GET endpoints.** `GET /auth/oauth/{provider}`, `GET /auth/oauth/callback`, and `GET /auth/sso` do not call `checkRateLimit`. They do not guess credentials, so abuse surface is DoS / provider quota / DB load rather than credential attacks. Put these behind proxy-level rate limits if that matters.
 
 ### Redirect URI policy
 
@@ -254,7 +280,7 @@ To stream audit events: `grep AUDIT <logfile>` or configure your log aggregator 
 - `iss` — issuer, set to `auth.base-url` (e.g. `https://auth.example.com`). Consuming services should validate this.
 - `aud` — set to `appId` when present. Consuming services **must** validate this to prevent cross-app token reuse. Tokens without `aud` are app-agnostic (issued without `X-App-Id`).
 - `kid` — key ID in the JWT header; matches the `kid` field in the JWKS response. Re-fetch JWKS when you encounter an unknown `kid`.
-- `groups` — list containing the user's role for the given app (e.g. `["user"]` or `["admin"]`). Only present when `appId` is set and the user has a `user_app_access` row. Consuming services using Quarkus/MP-JWT can use `@RolesAllowed` against this claim directly.
+- `groups` — list containing the user's role for the given app (e.g. `["user"]` or `["admin"]`). Present only when `appId` is set **and** the user has a `user_app_access` row for that app. A token can carry `aud` without `groups` (app exists but is not gated / no explicit role row) — consuming services using `@RolesAllowed` must handle the absence of `groups` as "unauthorized for role-scoped routes", not "fall through to defaults".
 - `iat` / `exp` — issued-at and expiry timestamps.
 
 Tokens are signed with ES256 (ECDSA P-256). Verify using the public key from `GET /.well-known/jwks.json`.

@@ -60,12 +60,19 @@ class JwtService @Inject constructor(
         return builder.signWith(ecKeyService.privateKey).compact()
     }
 
-    fun verify(token: String): Claims? {
+    /**
+     * Verify a JWT's signature and issuer, and optionally require it to carry a specific audience.
+     * When `expectedAudience` is non-null, tokens without `aud` or with a mismatched `aud` are rejected —
+     * this is the cross-app reuse guard that every app-scoped consumer MUST pass their own appId to.
+     * When null, aud is not checked (appropriate only for endpoints that don't mix apps, like /auth/me).
+     */
+    fun verify(token: String, expectedAudience: String? = null): Claims? {
         return try {
-            val claims = Jwts.parser()
+            val parser = Jwts.parser()
                 .verifyWith(ecKeyService.publicKey)
                 .requireIssuer(issuer)
-                .build()
+            if (expectedAudience != null) parser.requireAudience(expectedAudience)
+            val claims = parser.build()
                 .parseSignedClaims(token)
                 .payload
             Claims(
