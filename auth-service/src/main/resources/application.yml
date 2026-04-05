@@ -28,6 +28,11 @@ quarkus:
       access-control-max-age: 24H
   otel:
     enabled: true
+  log:
+    console:
+      # %X{traceId}/%X{spanId} populated automatically by quarkus-opentelemetry;
+      # shown as `trace=<id>/<id>` for cross-service log correlation in Loki.
+      format: "%d{HH:mm:ss.SSS} %-5p [%-30c{2.}] [trace=%X{traceId:-}/%X{spanId:-}] %s%e%n"
 
 auth:
   jwt:
