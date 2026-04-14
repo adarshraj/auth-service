@@ -66,6 +66,18 @@ auth:
     # Cookie domain for platform_session cookie (e.g. ".homelab.local" for *.homelab.local).
     # Leave empty for localhost/dev (cookie scoped to auth-service origin only).
     cookie-domain: ${AUTH_SESSION_COOKIE_DOMAIN:}
+  # Platform email-service integration. Disabled by default so local dev without email-service
+  # still works — flip AUTH_EMAIL_SERVICE_ENABLED=true to wire verification mails on signup.
+  email-service:
+    enabled: ${AUTH_EMAIL_SERVICE_ENABLED:false}
+    base-url: ${AUTH_EMAIL_SERVICE_URL:http://localhost:8706}
+    # Synthetic "service user" identity used to sign JWTs auth-service sends to email-service.
+    # email-service verifies these via the same JWKS endpoint it uses for real user tokens.
+    service-user-id: ${AUTH_EMAIL_SERVICE_USER_ID:svc-auth-service}
+    service-email: ${AUTH_EMAIL_SERVICE_USER_EMAIL:svc-auth-service@internal}
+  email-verification:
+    expiry-hours: ${AUTH_EMAIL_VERIFICATION_EXPIRY_HOURS:24}
+    from: ${AUTH_EMAIL_VERIFICATION_FROM:noreply@localhost}
 
 "%dev":
   quarkus:

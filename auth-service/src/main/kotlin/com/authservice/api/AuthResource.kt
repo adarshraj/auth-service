@@ -19,6 +19,7 @@ import com.authservice.security.JwtFilter
 import com.authservice.security.MfaNonceStore
 import com.authservice.security.OAuthNonceStore
 import com.authservice.security.RateLimiter
+import com.authservice.service.EmailVerificationService
 import com.authservice.service.JwtService
 import com.authservice.service.OAuthService
 import com.authservice.service.TotpService
@@ -62,6 +63,7 @@ class AuthResource @Inject constructor(
     private val userService: UserService,
     private val jwtService: JwtService,
     private val oauthService: OAuthService,
+    private val emailVerificationService: EmailVerificationService,
     private val rateLimiter: RateLimiter,
     private val appRepository: AppRepository,
     private val oauthCodeRepository: OAuthCodeRepository,
@@ -104,10 +106,30 @@ class AuthResource @Inject constructor(
             name = body.name,
             appId = validatedAppId,
         )
+        // Best-effort verification email. email-service outages must not block registration;
+        // the user can request a resend later via a dedicated endpoint.
+        emailVerificationService.sendVerificationEmail(user.id, user.email, user.name)
         val role = validatedAppId?.let { userService.getRole(user.id, it) }
         val token = jwtService.sign(user.id, user.email, validatedAppId, role)
         val refreshToken = userService.issueRefreshToken(user.id, validatedAppId)
         return Response.status(201).entity(AuthResponse(token, refreshToken, user.toResponse())).build()
+    }
+
+    // ── Email verification ────────────────────────────────────────────────────
+    // Note: /auth/verify is already owned by VerifyResource (Traefik ForwardAuth),
+    // so email-verification links live under /auth/email/verify instead.
+
+    @GET
+    @Path("/email/verify")
+    @Transactional
+    @Operation(summary = "Consume an email verification token and mark the user's email as verified")
+    fun verifyEmail(@QueryParam("token") token: String?): Response {
+        if (token.isNullOrBlank()) {
+            throw BadRequestException("Missing token")
+        }
+        val (userId, _) = userService.consumeAuthToken(token, "email_verification")
+        userService.markEmailVerified(userId)
+        return Response.ok(mapOf("verified" to true, "userId" to userId)).build()
     }
 
     // ── Login ─────────────────────────────────────────────────────────────────

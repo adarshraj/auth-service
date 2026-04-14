@@ -199,6 +199,16 @@ class UserService @Inject constructor(
         userRepository.delete(user)
     }
 
+    @Transactional
+    fun markEmailVerified(userId: String) {
+        val user = userRepository.findById(userId) ?: throw NotFoundException("User not found")
+        if (!user.emailVerified) {
+            user.emailVerified = true
+            user.updatedAt = Instant.now()
+            log.infof("AUDIT email_verified userId=%s email=%s", user.id, user.email)
+        }
+    }
+
     // ── App access management (called from AppResource) ───────────────────────
 
     @Transactional
