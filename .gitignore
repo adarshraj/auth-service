@@ -2,6 +2,9 @@
 target/
 *.class
 
+# Dev databases (SQLite files created by ./mvnw quarkus:dev)
+*.db
+
 # IDE
 .idea/
 *.iml
