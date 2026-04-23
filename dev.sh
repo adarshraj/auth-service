@@ -45,5 +45,4 @@ echo "  JWT_SECRET       = ${JWT_SECRET:0:8}... (${#JWT_SECRET} chars)"
 echo "  AUTH_ADMIN_KEY   = ${AUTH_ADMIN_KEY:-(not set — admin API disabled)}"
 echo "  AUTH_BASE_URL    = ${AUTH_BASE_URL:-http://localhost:8703}"
 
-cd auth-service
 ./mvnw quarkus:dev

@@ -9,7 +9,7 @@ version: "3.9"
 #   QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://localhost:5432/authservice \
 #   QUARKUS_DATASOURCE_USERNAME=authservice \
 #   QUARKUS_DATASOURCE_PASSWORD=authservice \
-#   cd auth-service && ./mvnw quarkus:dev
+#   ./mvnw quarkus:dev
 #
 #   docker compose down           # stop and remove containers
 #   docker compose down -v        # also remove the data volume

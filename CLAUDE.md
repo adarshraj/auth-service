@@ -8,7 +8,7 @@ Standalone authentication service for the personal app ecosystem. Kotlin + Quark
 
 ## Commands
 
-All commands run from `auth-service/` (the inner directory with `pom.xml`):
+All commands run from the project root (where `pom.xml` lives):
 
 ```bash
 # Dev mode (hot reload, SQLite, no DB setup needed)

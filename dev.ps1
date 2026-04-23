@@ -56,5 +56,4 @@ Write-Host "  JWT_SECRET       = $($env:JWT_SECRET.Substring(0, [Math]::Min(8, $
 Write-Host "  AUTH_ADMIN_KEY   = $adminKeyDisplay"
 Write-Host "  AUTH_BASE_URL    = $baseUrl"
 
-Set-Location auth-service
 .\mvnw.cmd quarkus:dev

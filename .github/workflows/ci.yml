@@ -23,7 +23,6 @@ jobs:
           cache: maven
 
       - name: Build and run tests
-        working-directory: auth-service
         run: ./mvnw verify -B
 
       - name: Upload test reports
@@ -31,5 +30,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-reports
-          path: auth-service/target/surefire-reports/
+          path: target/surefire-reports/
           retention-days: 7

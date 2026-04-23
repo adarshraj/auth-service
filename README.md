@@ -213,7 +213,7 @@ SQLite is used by default — no database setup needed. The EC key pair is gener
 
 ## Production
 
-All commands below run from the `auth-service/` directory (where `pom.xml` lives).
+All commands below run from the project root (where `pom.xml` lives).
 
 **Profile:** A packaged run uses Quarkus's **`prod`** profile. On startup, the service refuses to boot unless all four HMAC secrets (`AUTH_KEY_HMAC_SECRET`, `AUTH_STATE_HMAC_SECRET`, `AUTH_TOKEN_PEPPER`, `AUTH_MFA_HMAC_SECRET`) are set to non-default values. Set `AUTH_ADMIN_KEY` if you need the `/auth/apps` admin API.
 
