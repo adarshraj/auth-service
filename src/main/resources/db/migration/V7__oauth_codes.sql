@@ -7,6 +7,6 @@ CREATE TABLE oauth_codes (
     email       TEXT NOT NULL,
     app_id      TEXT,
     expires_at  TEXT NOT NULL,
-    used        INTEGER NOT NULL DEFAULT 0,
+    used        BOOLEAN NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL
 );

@@ -6,7 +6,7 @@ CREATE TABLE auth_tokens (
     token      TEXT    NOT NULL UNIQUE,
     type       TEXT    NOT NULL,  -- 'password_reset' | 'magic_link' | 'email_verification'
     expires_at TEXT    NOT NULL,
-    used       INTEGER NOT NULL DEFAULT 0,
+    used       BOOLEAN NOT NULL DEFAULT 0,
     created_at TEXT    NOT NULL
 );
 

@@ -10,6 +10,7 @@ import jakarta.ws.rs.core.NewCookie
 import jakarta.ws.rs.ext.Provider
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import java.util.Date
+import java.util.Optional
 
 /**
  * Sets a `platform_session` cookie on successful auth responses.
@@ -24,9 +25,11 @@ import java.util.Date
 @Provider
 @Priority(Priorities.HEADER_DECORATOR)
 class SessionCookieFilter(
-    @ConfigProperty(name = "auth.session.cookie-domain", defaultValue = "") private val cookieDomain: String,
+    @ConfigProperty(name = "auth.session.cookie-domain") private val cookieDomainOpt: Optional<String>,
     @ConfigProperty(name = "auth.jwt.expiry-seconds", defaultValue = "900") private val jwtExpirySeconds: Long,
 ) : ContainerResponseFilter {
+
+    private val cookieDomain: String get() = cookieDomainOpt.orElse("")
 
     companion object {
         private val TOKEN_PATHS = setOf(

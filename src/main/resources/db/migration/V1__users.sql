@@ -7,7 +7,7 @@ CREATE TABLE users (
     avatar_url      TEXT,
     oauth_provider  TEXT,                              -- 'google' | 'github' | null
     oauth_id        TEXT,                              -- provider's user id
-    email_verified  INTEGER     NOT NULL DEFAULT 0,    -- boolean
+    email_verified  BOOLEAN     NOT NULL DEFAULT 0,
     created_at      TEXT        NOT NULL,              -- ISO-8601 UTC
     updated_at      TEXT        NOT NULL
 );
